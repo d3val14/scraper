@@ -46,7 +46,7 @@ jobs:
           CURR_URL: ${{ secrets.CURR_URL }}
           MAX_WORKERS: 16
           BATCH_SIZE: 1000
-        run: php parallel_scraper.php
+        run: php scraper.php
         
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
