@@ -4,43 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Site Url to scrape"
         required: true
         default: "https://www.graysonliving.com"
       total_sitemaps:
-        description: "Total sitemaps to scrape (0 = all)"
-        required: false
         default: "0"
       sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        required: true
         default: "2"
       urls_per_sitemap:
-        description: "Product URLs per sitemap (0 = all)"
-        required: false
         default: "200"
-
-  schedule:
-    - cron: "0 3 * * *"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
-
     steps:
-      - name: Generate matrix
-        id: matrix
+      - id: matrix
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps || 0 }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job || 2 }}
-          URL=${{ github.event.inputs.url || 2 }}
+          TOTAL=${{ github.event.inputs.total_sitemaps }}
+          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
+          URL=${{ github.event.inputs.url }}
 
-          if [ "$TOTAL" -eq 0 ]; then
-            TOTAL=20
-          fi
-
+          [ "$TOTAL" -eq 0 ] && TOTAL=20
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
 
           MATRIX="["
@@ -59,51 +44,63 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.1"
-          extensions: ftp, simplexml
-          ini-values: memory_limit=1024M, max_execution_time=0
+          extensions: simplexml
 
       - name: Run scraper
         env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_BASE_DIR: ${{ secrets.FTP_OUTPUT_PATH }}
           CURR_URL: ${{ matrix.url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
-          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap || 200 }}
+          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
         run: php scraper.php
 
-      - name: Upload chunk
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: products_chunk_${{ matrix.offset }}
-          path: products_chunk.csv
+          name: chunk_${{ matrix.offset }}
+          path: products_chunk_*.csv
 
   merge:
     needs: scrape
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: chunks
 
-      - name: Merge CSV files
+      - name: Merge clean CSV
         run: |
-          head -n 1 chunks/*/products_chunk.csv > products_full.csv
-          tail -n +2 chunks/*/products_chunk.csv >> products_full.csv
+          FIRST=$(ls chunks/*/*.csv | head -n 1)
+          head -n 1 "$FIRST" > products_full.csv
 
-      - name: Upload final CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: products_full
-          path: products_full.csv
+          for f in chunks/*/*.csv; do
+            tail -n +2 "$f" | sed '/^$/d' >> products_full.csv
+          done
+
+      - name: Build filename
+        id: meta
+        run: |
+          SITE=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|/||g')
+          DATE=$(date +%F)
+          echo "name=${SITE}_${DATE}.csv" >> $GITHUB_OUTPUT
+
+      - name: Upload to FTP
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_BASE_DIR: ${{ secrets.FTP_OUTPUT_PATH }}
+          FILE: ${{ steps.meta.outputs.name }}
+        run: |
+          sudo apt-get install -y lftp
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+          mkdir -p $FTP_BASE_DIR
+          cd $FTP_BASE_DIR
+          put products_full.csv -o $FILE
+          bye
+          EOF
