@@ -72,7 +72,8 @@ function processProduct(string $url, $csv, array &$seen): void
     }
 
     $options = $product['options'] ?? [];
-    $images  = $product['images'] ?? '';
+    $images  = $product['featured_image'] ?? '';
+    $images = normalizeImage($images);
 
     logMsg("Variants found: " . count($product['variants']));
 
