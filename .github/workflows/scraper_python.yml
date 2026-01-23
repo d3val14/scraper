@@ -5,7 +5,7 @@ on:
     inputs:
       url:
         required: true
-        default: "https://www.graysonliving.com"
+        default: "https://www.afastores.com"
       total_sitemaps:
         description: "Total sitemaps to process (0 = auto-detect)"
         default: "0"
@@ -28,8 +28,8 @@ jobs:
           if [ "${{ github.event.inputs.total_sitemaps }}" != "0" ]; then
             echo "total=${{ github.event.inputs.total_sitemaps }}" >> $GITHUB_OUTPUT
           else
-            # Try to detect sitemap count automatically
-            echo "total=20" >> $GITHUB_OUTPUT  # Default fallback
+            # Default fallback for afastores.com
+            echo "total=15" >> $GITHUB_OUTPUT
           fi
 
   plan:
@@ -81,7 +81,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install cloudscraper beautifulsoup4 lxml requests
-
+          # Try to install undetected-chromedriver if possible
+          pip install undetected-chromedriver || echo "undetected-chromedriver installation failed, continuing without it"
+          
+      - name: Install Chrome for fallback
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
