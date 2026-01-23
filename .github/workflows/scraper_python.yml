@@ -1,4 +1,4 @@
-name: Parallel Sitemap Scraper
+name: Parallel Sitemap Scraper Python
 
 on:
   workflow_dispatch:
@@ -7,77 +7,220 @@ on:
         required: true
         default: "https://www.afastores.com"
       total_sitemaps:
-        default: "15"
+        description: "Total sitemaps to process (0 = auto-detect)"
+        default: "0"
       sitemaps_per_job:
-        default: "1"
+        description: "Number of sitemaps per job"
+        default: "2"
+      urls_per_sitemap:
+        description: "Max URLs to process per sitemap"
+        default: "200"
 
 jobs:
-  plan:
+  detect-sitemaps:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      total_sitemaps: ${{ steps.detect.outputs.total }}
     steps:
-      - id: set-matrix
+      - name: Detect total sitemaps
+        id: detect
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
+          if [ "${{ github.event.inputs.total_sitemaps }}" != "0" ]; then
+            echo "total=${{ github.event.inputs.total_sitemaps }}" >> $GITHUB_OUTPUT
+          else
+            # Default fallback for afastores.com
+            echo "total=15" >> $GITHUB_OUTPUT
+          fi
+
+  plan:
+    runs-on: ubuntu-latest
+    needs: detect-sitemaps
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        run: |
+          TOTAL=${{ needs.detect-sitemaps.outputs.total_sitemaps }}
           PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
+          URL="${{ github.event.inputs.url }}"
+          
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+          
           MATRIX="["
           for ((i=0; i<JOBS; i++)); do
             OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"${{ github.event.inputs.url }}\"},"
+            LIMIT=$(( PER_JOB ))
+            # Don't exceed total sitemaps
+            if [ $((OFFSET + LIMIT)) -gt $TOTAL ]; then
+              LIMIT=$(( TOTAL - OFFSET ))
+            fi
+            MATRIX+="{\"offset\":$OFFSET,\"limit\":$LIMIT,\"url\":\"$URL\"},"
           done
           MATRIX="${MATRIX%,}]"
+          
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Job configuration:"
+          echo $MATRIX | jq '.'
 
   scrape:
     needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 1  # IMPORTANT: Do not run parallel to avoid IP bans
+      max-parallel: 3  # Limit concurrent jobs to avoid rate limiting
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-      
+          python-version: "3.11"
+          cache: 'pip'
+          
       - name: Install dependencies
         run: |
-          pip install curl_cffi beautifulsoup4
+          python -m pip install --upgrade pip
+          pip install cloudscraper beautifulsoup4 lxml requests
+          
+      - name: Verify installation
+        run: |
+          python --version
+          pip list
+          python -c "import cloudscraper; print('cloudscraper version:', cloudscraper.__version__)"
+          
+      - name: Test network connectivity
+        run: |
+          echo "Testing connectivity to ${{ matrix.url }}"
+          curl -I "${{ matrix.url }}" || echo "Direct curl failed (expected if Cloudflare protected)"
           
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
-          MAX_URLS_PER_SITEMAP: 100
-        run: python scrapercloud.py
+          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
+        run: |
+          echo "Starting scraper with:"
+          echo "  URL: $CURR_URL"
+          echo "  Offset: $SITEMAP_OFFSET"
+          echo "  Max Sitemaps: $MAX_SITEMAPS"
+          echo "  Max URLs per Sitemap: $MAX_URLS_PER_SITEMAP"
+          python scrapercloud.py 2>&1 | tee scraper_log_${{ matrix.offset }}.txt
+        continue-on-error: true
 
-      - uses: actions/upload-artifact@v4
+      - name: Check output
+        run: |
+          echo "=== Scraper Output Check ==="
+          if [ -f "products_chunk_${{ matrix.offset }}.csv" ]; then
+            echo "✓ CSV file created"
+            wc -l "products_chunk_${{ matrix.offset }}.csv"
+            echo "First few lines:"
+            head -n 5 "products_chunk_${{ matrix.offset }}.csv"
+          else
+            echo "❌ CSV file NOT created"
+            exit 1
+          fi
+          
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs_${{ matrix.offset }}
+          path: scraper_log_*.txt
+          retention-days: 7
+
+      - name: Upload CSV chunk
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: chunk_${{ matrix.offset }}
           path: products_chunk_*.csv
+          retention-days: 1
 
   merge:
     needs: scrape
     runs-on: ubuntu-latest
+    if: success() || failure()  # Run even if some scrape jobs fail
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: chunks
           pattern: chunk_*
           merge-multiple: true
-      
-      - name: Merge
+
+      - name: Merge CSV files
         run: |
-          head -n 1 $(ls chunks/*.csv | head -n 1) > final_output.csv
-          for f in chunks/*.csv; do tail -n +2 "$f" >> final_output.csv; done
+          # Find all CSV files
+          find chunks -name "products_chunk_*.csv" -type f | sort -V > csv_files.txt
           
-      - uses: actions/upload-artifact@v4
+          if [ ! -s csv_files.txt ]; then
+            echo "❌ No CSV files found!"
+            exit 1
+          fi
+          
+          echo "Found CSV files:"
+          cat csv_files.txt
+          
+          # Get header from first file
+          first_file=$(head -n1 csv_files.txt)
+          head -n 1 "$first_file" > products_full.csv
+          
+          # Append all data (skip headers)
+          while IFS= read -r file; do
+            echo "Processing: $file"
+            tail -n +2 "$file" | sed '/^$/d' >> products_full.csv
+          done < csv_files.txt
+          
+          # Count results
+          total_lines=$(wc -l < products_full.csv)
+          echo "✅ Total records: $((total_lines - 1))"
+
+      - name: Build filename
+        id: meta
+        run: |
+          SITE=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|[/:?#]|_|g;s/_*$//')
+          DATE=$(date +%F)
+          COUNT=$(tail -n +2 products_full.csv | wc -l)
+          echo "name=${SITE}_${DATE}_${COUNT}items.csv" >> $GITHUB_OUTPUT
+          echo "📊 Final filename: ${SITE}_${DATE}_${COUNT}items.csv"
+
+      - name: Upload to FTP
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_BASE_DIR: ${{ secrets.FTP_OUTPUT_PATH }}
+          FILE: ${{ steps.meta.outputs.name }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lftp
+          
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+          set ssl:verify-certificate no
+          mkdir -p "$FTP_BASE_DIR"
+          cd "$FTP_BASE_DIR"
+          put products_full.csv -o "$FILE"
+          ls -la "$FILE"
+          bye
+          EOF
+          
+          echo "✅ Uploaded to FTP: $FILE"
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: final_csv
-          path: final_output.csv
+          name: final_output
+          path: |
+            products_full.csv
+          retention-days: 7
+          
+      - name: Summary
+        run: |
+          echo "## Scraping Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Products:** $(tail -n +2 products_full.csv | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Output File:** ${{ steps.meta.outputs.name }}" >> $GITHUB_STEP_SUMMARY
