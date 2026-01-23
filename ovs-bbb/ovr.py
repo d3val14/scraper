@@ -6,24 +6,25 @@ import gc
 import threading
 import requests
 import re
+import json
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= ENV =================
 
-CURR_URL = os.getenv("CURR_URL", "").rstrip("/")
-SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
-API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+CURR_URL = os.getenv("CURR_URL", "https://www.overstock.com").rstrip("/")
+SITEMAP_INDEX = os.getenv("SITEMAP_INDEX", "https://api.overstock.com/sitemaps/overstock-v3/us/sitemap.xml")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://www.overstock.com/api/product")
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.15"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 
 OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
-SCRAPED_DATE = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ================= LOGGER =================
 
@@ -35,31 +36,72 @@ def log(msg: str, level: str = "INFO"):
 # ================= HTTP SESSION =================
 
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-})
 
-def http_get(url: str) -> Optional[str]:
+def http_get(url: str, is_json: bool = False) -> Optional[str]:
+    """HTTP GET request with different headers for sitemap vs API requests"""
+    headers = {}
+    
+    if is_json:
+        # Headers for API/JSON requests only
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": f"{CURR_URL}/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+        }
+    else:
+        # Minimal headers for sitemap requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    
     for attempt in range(3):
         try:
-            r = session.get(url, timeout=30, verify=False)
+            r = session.get(url, headers=headers, timeout=15, verify=True)
             if r.status_code == 200:
+                log(f"Success fetching {url}", "DEBUG")
                 return r.text
             else:
                 log(f"Status {r.status_code} for {url}", "WARNING")
+                if r.status_code == 429:  # Rate limited
+                    time.sleep(5)
+        except requests.exceptions.Timeout:
+            log(f"Timeout on attempt {attempt+1} for {url}", "WARNING")
+            time.sleep(2)
         except Exception as e:
             log(f"Attempt {attempt+1} failed for {url}: {type(e).__name__}", "WARNING")
             time.sleep(1)
     return None
 
 def fetch_json(url: str) -> Optional[dict]:
+    """Fetch JSON data with proper headers"""
     try:
-        r = session.get(url, timeout=30)
-        return r.json() if r.status_code == 200 else None
+        # Headers specifically for JSON/API requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{CURR_URL}/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        
+        r = session.get(url, headers=headers, timeout=15, verify=True)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            log(f"JSON fetch failed: {r.status_code} for {url}", "WARNING")
+            return None
+    except json.JSONDecodeError as e:
+        log(f"JSON decode error for {url}: {e}", "ERROR")
+        return None
     except Exception as e:
         log(f"Error fetching JSON from {url}: {e}", "ERROR")
         return None
@@ -67,31 +109,50 @@ def fetch_json(url: str) -> Optional[dict]:
 # ================= SITEMAP PROCESSING =================
 
 def load_xml(url: str) -> Optional[ET.Element]:
-    data = http_get(url)
+    """Load XML with minimal headers (no API headers)"""
+    data = http_get(url, is_json=False)  # is_json=False for sitemap
     if not data:
+        log(f"Failed to load XML from {url}", "ERROR")
         return None
     try:
+        # Clean XML if needed
+        if "<?xml" not in data[:100]:
+            data = '<?xml version="1.0" encoding="UTF-8"?>\n' + data
         return ET.fromstring(data)
     except ET.ParseError as e:
-        log(f"XML parsing failed for {url}: {e}", "WARNING")
-        return None
+        log(f"XML parsing failed for {url}: {e}", "ERROR")
+        # Try to extract URLs with regex
+        try:
+            # Create a dummy element
+            root = ET.Element("urlset")
+            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', data)
+            for url_text in urls:
+                url_elem = ET.SubElement(root, "url")
+                loc_elem = ET.SubElement(url_elem, "loc")
+                loc_elem.text = url_text
+            return root
+        except Exception as e2:
+            log(f"Regex extraction also failed: {e2}", "ERROR")
+            return None
 
 def extract_product_id(product_url: str) -> Optional[str]:
-    """Extract product ID from URL using various patterns"""
+    """Extract product ID from Overstock URL"""
     patterns = [
-        r'/(\d+)/product\.html$',
-        r'/product/(\d+)',
-        r'/(\d+)/',
-        r'\?product=(\d+)',
-        r'&product=(\d+)'
+        r'/(\d+)/product\.html',      
+        r'/product/(\d+)/',
+        r'/catalog/(\d+)/',
+        r'/[\w-]+/(\d+)\.html',
+        r'/(\d+)\.html',
+        r'[?&]IID=(\d+)',
     ]
-    
+
     for pattern in patterns:
         match = re.search(pattern, product_url)
         if match:
             product_id = match.group(1)
+            log(f"Extracted product ID {product_id} from {product_url}", "DEBUG")
             return product_id
-    
+
     log(f"No product ID found in URL: {product_url}", "WARNING")
     return None
 
@@ -100,142 +161,215 @@ def extract_product_id(product_url: str) -> Optional[str]:
 csv_lock = threading.Lock()
 
 def normalize_image_url(url: str) -> str:
-    """Normalize image URL"""
-    if url and url.startswith("//"):
+    """Normalize image URL for Overstock"""
+    if not url:
+        return ""
+    
+    if url.startswith("//"):
         return "https:" + url
-    elif url and not url.startswith("http"):
-        return f"{CURR_URL}{url}" if CURR_URL else url
-    return url or ""
+    elif url.startswith("/"):
+        return f"{CURR_URL}{url}"
+    elif not url.startswith("http"):
+        return f"https://ak1.ostkcdn.com{url}" if 'ostkcdn.com' not in url else f"https://{url}"
+    
+    return url
+
+def extract_overstock_data(product_data: dict) -> Dict:
+    """
+    Extract data from Overstock product API response
+    (schema-aligned to current Overstock JSON)
+    """
+    try:
+        product = product_data  # API already returns product root
+
+        # ---------- Basic ----------
+        product_id = str(product.get('productId', ''))
+        name = product.get('name', '').strip()
+
+        brand_obj = product.get('brand', {})
+        brand = brand_obj.get('name', '') if isinstance(brand_obj, dict) else str(brand_obj)
+
+        # ---------- SKU / MPN ----------
+        details = product.get('details', {})
+        sku = details.get('sku', '')
+
+        specs = product.get('specifications', {})
+        mpn = specs.get('Model Number', [''])[0]
+
+        # ---------- Category ----------
+        breadcrumbs = product.get('breadcrumbs', [])
+        category = ''
+        category_url = ''
+
+        if breadcrumbs:
+            last = breadcrumbs[-1]
+            category = last.get('label', '')
+            url = last.get('url', '')
+            category_url = f"{CURR_URL}{url}" if url.startswith('/') else url
+
+        # ---------- Images ----------
+        image_data = product.get('imageData', {})
+        main_image = image_data.get('productImageUrl', '')
+
+        # ---------- Variations (pick first SELLABLE) ----------
+        variations = product.get('variations', [])
+
+        variation_id = ''
+        quantity = 0
+        status = 'OUT_OF_STOCK'
+        price = ''
+        group_attr_1 = ''
+        group_attr_2 = ''
+
+        selected_variation = None
+        for v in variations:
+            if v.get('status') == 'SELLABLE':
+                selected_variation = v
+                break
+
+        if not selected_variation and variations:
+            selected_variation = variations[0]
+
+        if selected_variation:
+            variation_id = selected_variation.get('variationId')
+
+            inventory = selected_variation.get('inventory', {})
+            quantity = inventory.get('quantityAvailable', 0)
+
+            status = selected_variation.get('status', '')
+
+            prices = selected_variation.get('prices', {})
+            sale = prices.get('salePrice', {})
+            base = prices.get('basePrice', {})
+
+            price = (
+                sale.get('amount')
+                or base.get('amount')
+                or ''
+            )
+
+            # Variation name usually carries size
+            group_attr_1 = selected_variation.get('description', '')
+            group_attr_2 = selected_variation.get('fullSku', '')
+
+        return {
+            'product_id': product_id,
+            'name': name,
+            'brand': brand,
+            'price': price,
+            'main_image': main_image,
+            'sku': sku,
+            'mpn': mpn,
+            'category': category,
+            'category_url': category_url,
+            'quantity': quantity,
+            'status': status,
+            'variation_id': variation_id,
+            'group_attr_1': group_attr_1,
+            'group_attr_2': group_attr_2
+        }
+    except Exception as e:
+        log(f"Error extracting Overstock data: {e}", "ERROR")
+        return {}
 
 def process_product_data(product_url: str, writer, seen: set, stats: dict):
-    """Process a single product URL"""
+    """Process a single Overstock product URL"""
     if product_url in seen:
         return
     seen.add(product_url)
+    
+    log(f"Processing product URL: {product_url}", "DEBUG")
     
     # Extract product ID
     product_id = extract_product_id(product_url)
     if not product_id:
         stats['errors'] += 1
+        log(f"No product ID found for URL: {product_url}", "ERROR")
         return
     
-    # Fetch product data from API
-    api_url = f"{API_BASE_URL}/{product_id}"
-    data = fetch_json(api_url)
+    # Fetch product data from API - Overstock may have different endpoints
+    # Try multiple possible API endpoints
+    api_endpoints = [
+        f"https://www.overstock.com/api/product/{product_id}",
+    ]
     
-    if not data or data.get('statusCode') != 200 or not data.get('ok'):
+    data = None
+    for api_url in api_endpoints:
+        log(f"Trying API endpoint: {api_url}", "DEBUG")
+        data = fetch_json(api_url)  # This uses JSON-specific headers
+        if data:
+            break
+        time.sleep(0.5)
+    
+    if not data:
+        # Try direct product page scraping as fallback
+        log(f"API failed, trying direct page for {product_id}", "WARNING")
+        page_content = http_get(product_url, is_json=False)  # Minimal headers for HTML page
+        if page_content:
+            # Look for JSON-LD or product data in page
+            json_ld_pattern = r'<script type="application/ld\+json">(.*?)</script>'
+            matches = re.findall(json_ld_pattern, page_content, re.DOTALL)
+            if matches:
+                try:
+                    data = json.loads(matches[0])
+                except:
+                    pass
+    
+    if not data:
         stats['errors'] += 1
+        log(f"No data found for product {product_id}", "ERROR")
         return
     
-    # Process product data
+    # Extract data from response
+    product_info = extract_overstock_data(data)
+    if not product_info.get('product_id'):
+        stats['errors'] += 1
+        log(f"Invalid data for product {product_id}", "ERROR")
+        return
+    
     try:
-        # Check for multiple variations
-        multiple_variations = data.get('multipleInStockVariations', False)
-        variations = data.get('variations', [])
+        # Prepare row data
+        variation_param = f"?option={product_info['variation_id']}" if product_info['variation_id'] else ""
+        row = [
+            product_url + variation_param,
+            product_info['product_id'],  # Ref Product ID
+            product_info['variation_id'],  # Ref Varient ID
+            product_info['category'],  # Ref Category
+            product_info['category_url'],  # Ref Category URL
+            product_info['brand'],  # Ref Brand Name
+            product_info['name'],  # Ref Product Name
+            product_info['sku'],  # Ref SKU
+            product_info['mpn'],  # Ref MPN
+            '',  # Ref GTIN (empty for now)
+            product_info['price'],  # Ref Price
+            normalize_image_url(product_info['main_image']),  # Ref Main Image
+            product_info['quantity'],  # Ref Quantity
+            product_info['group_attr_1'],  # Ref Group Attr 1
+            product_info['group_attr_2'],  # Ref Group Attr 2
+            product_info['status'],  # Ref Status
+            SCRAPED_DATE  # Date Scrapped
+        ]
         
-        if multiple_variations and len(variations) > 1:
-            # Process each variation
-            for variation in variations:
-                variation_id = variation.get('variationId', '')
-                full_sku = variation.get('fullSku', '')
-                
-                # Create variation-specific URL
-                if variation_id:
-                    variation_url = f"{product_url}?option={variation_id}"
-                else:
-                    variation_url = product_url
-                
-                # Get breadcrumbs for category
-                breadcrumbs = data.get('breadcrumbs', [])
-                if breadcrumbs:
-                    last_url = breadcrumbs[-1].get('url', '').lstrip('/')
-                    category = breadcrumbs[-1].get('label', '')
-                    category_url = f"{CURR_URL}/{last_url}" if last_url else ''
-                else:
-                    category = ''
-                    category_url = ''
-                
-                # Prepare row data
-                row = [
-                    variation_url,  # Ref Product URL
-                    product_id,     # Ref Product ID
-                    variation_id,   # Ref Varient ID
-                    category,       # Ref Category
-                    category_url,   # Ref Category URL
-                    data.get('brand', {}).get('name', ''),  # Ref Brand Name
-                    data.get('name', ''),  # Ref Product Name
-                    full_sku,       # Ref SKU
-                    data.get('specifications', {}).get('Model Number', [''])[0] if data.get('specifications', {}).get('Model Number') else '',  # Ref MPN
-                    '',  # Ref GTIN (empty for now)
-                    variation.get('prices', {}).get('salePrice', {}).get('amount', 
-                        variation.get('prices', {}).get('basePrice', {}).get('amount',
-                        data.get('selectedPrice', {}).get('amount', ''))),  # Ref Price
-                    normalize_image_url(data.get('images', [{}])[0].get('url', '') if data.get('images') else data.get('imageData', {}).get('productImageUrl', '')),  # Ref Main Image
-                    variation.get('quantityAvailable', ''),  # Ref Quantity
-                    data.get('specifications', {}).get('Color', [''])[0] if data.get('specifications', {}).get('Color') else '',  # Ref Group Attr 1
-                    data.get('specifications', {}).get('Material', [''])[0] if data.get('specifications', {}).get('Material') else data.get('specifications', {}).get('Top Material', [''])[0] if data.get('specifications', {}).get('Top Material') else '',  # Ref Group Attr 2
-                    'In Stock' if variation.get('status') == 'SELLABLE' or variation.get('sellableStatus') == 'SELLABLE' else 'Out of Stock',  # Ref Status
-                    SCRAPED_DATE  # Date Scrapped
-                ]
-                
-                with csv_lock:
-                    writer.writerow(row)
-                
-                stats['products_fetched'] += 1
-            
-            log(f"Fetched {len(variations)} variations for product {product_id}")
-        else:
-            # Single product or no variations
-            breadcrumbs = data.get('breadcrumbs', [])
-            if breadcrumbs:
-                last_url = breadcrumbs[-1].get('url', '').lstrip('/')
-                category = breadcrumbs[-1].get('label', '')
-                category_url = f"{CURR_URL}/{last_url}" if last_url else ''
-            else:
-                category = ''
-                category_url = ''
-            
-            # Prepare row data for single product
-            row = [
-                product_url,  # Ref Product URL
-                product_id,   # Ref Product ID
-                data.get('variations', [{}])[0].get('variationId', '') if data.get('variations') else '',  # Ref Varient ID
-                category,     # Ref Category
-                category_url, # Ref Category URL
-                data.get('brand', {}).get('name', ''),  # Ref Brand Name
-                data.get('name', ''),  # Ref Product Name
-                data.get('details', {}).get('sku', ''),  # Ref SKU
-                data.get('specifications', {}).get('Model Number', [''])[0] if data.get('specifications', {}).get('Model Number') else '',  # Ref MPN
-                '',  # Ref GTIN
-                data.get('selectedPrice', {}).get('amount', ''),  # Ref Price
-                normalize_image_url(data.get('images', [{}])[0].get('url', '') if data.get('images') else data.get('imageData', {}).get('productImageUrl', '')),  # Ref Main Image
-                data.get('variations', [{}])[0].get('quantityAvailable', '') if data.get('variations') else '',  # Ref Quantity
-                data.get('specifications', {}).get('Color', [''])[0] if data.get('specifications', {}).get('Color') else '',  # Ref Group Attr 1
-                data.get('specifications', {}).get('Material', [''])[0] if data.get('specifications', {}).get('Material') else data.get('specifications', {}).get('Top Material', [''])[0] if data.get('specifications', {}).get('Top Material') else '',  # Ref Group Attr 2
-                'In Stock' if data.get('inStock', False) else 'Out of Stock',  # Ref Status
-                SCRAPED_DATE  # Date Scrapped
-            ]
-            
-            with csv_lock:
-                writer.writerow(row)
-            
-            stats['products_fetched'] += 1
-            log(f"Fetched single product {product_id}")
+        with csv_lock:
+            writer.writerow(row)
         
-        stats['urls_processed'] += 1
+        stats['products_fetched'] += 1
+        name_preview = product_info['name'][:50] + "..." if len(product_info['name']) > 50 else product_info['name']
+        log(f"Fetched product {product_info['product_id']}: {name_preview}", "INFO")
         
     except Exception as e:
-        log(f"Error processing product {product_id}: {e}", "ERROR")
+        log(f"Error creating row for product {product_id}: {e}", "ERROR")
         stats['errors'] += 1
     
     # Respect request delay
     time.sleep(REQUEST_DELAY)
+    stats['urls_processed'] += 1
 
 # ================= MAIN =================
 
 def main():
     log("=" * 60)
-    log("Starting Parallel Scraper")
+    log("Overstock Parallel Scraper")
     log(f"Timestamp: {SCRAPED_DATE}")
     log(f"Base URL: {CURR_URL}")
     log(f"API Base URL: {API_BASE_URL}")
@@ -247,23 +381,32 @@ def main():
     log(f"Request Delay: {REQUEST_DELAY}s")
     log("=" * 60)
     
-    # Load sitemap index
+    # Load sitemap index - NO HEADERS for sitemap
+    log(f"Loading sitemap index from {SITEMAP_INDEX}")
     index = load_xml(SITEMAP_INDEX)
-    if not index:
+    if index is None:
         log("Failed to load sitemap index", "ERROR")
         sys.exit(1)
     
     # Extract sitemap URLs
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = [e.text for e in index.findall(".//ns:sitemap/ns:loc", ns)]
+    sitemaps = []
     
-    # Fallback if namespace not found
-    if not sitemaps:
-        sitemaps = [e.text for e in index.findall(".//sitemap/loc")]
+    # Try different XML structures
+    for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+        elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+        if elements:
+            sitemaps = [e.text.strip() for e in elements if e.text]
+            break
     
+    # If still no sitemaps, use defaults
     if not sitemaps:
-        log("No sitemaps found in index", "ERROR")
-        sys.exit(1)
+        log("No sitemaps found with XML parsing, using defaults", "WARNING")
+        sitemaps = [
+            "https://www.overstock.com/sitemap_products_1.xml",
+            "https://www.overstock.com/sitemap_products_2.xml",
+            "https://www.overstock.com/sitemap.xml",
+        ]
     
     # Apply offset and limit
     if SITEMAP_OFFSET >= len(sitemaps):
@@ -315,19 +458,33 @@ def main():
             stats['sitemaps_processed'] += 1
             log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
             
-            # Load product sitemap
+            # Load product sitemap - NO HEADERS for sitemap
             xml = load_xml(sitemap_url)
             if not xml:
                 log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
                 continue
             
-            # Extract product URLs
-            urls = [e.text for e in xml.findall(".//ns:url/ns:loc", ns)]
-            if not urls:
-                urls = [e.text for e in xml.findall(".//url/loc")]
+            # Extract product URLs - Overstock product URLs typically contain /product/ or /catalog/
+            urls = []
+            for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                if elements:
+                    urls = [
+                        e.text.strip()
+                        for e in elements
+                        if e.text
+                        and (
+                            '/product/' in e.text
+                            or '/product.html' in e.text
+                            or '/catalog/' in e.text
+                            or 'IID=' in e.text
+                        )
+                    ]
+                    if urls:
+                        break
             
             if not urls:
-                log(f"No URLs found in sitemap: {sitemap_url}", "WARNING")
+                log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
                 continue
             
             # Apply URL limit
@@ -370,13 +527,13 @@ def main():
     log("=" * 60)
 
 if __name__ == "__main__":
+    # Suppress SSL warnings
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     # Validate environment variables
     if not CURR_URL:
         log("Error: CURR_URL environment variable is required", "ERROR")
-        sys.exit(1)
-    
-    if not API_BASE_URL:
-        log("Error: API_BASE_URL environment variable is required", "ERROR")
         sys.exit(1)
     
     main()
