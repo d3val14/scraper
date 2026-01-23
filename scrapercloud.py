@@ -39,7 +39,7 @@ class CloudflareBypassSession:
     def __init__(self):
         self.session = cloudscraper.create_scraper(
             browser={
-                'browser': 'chrome',
+                'browser': 'firefox',
                 'platform': 'windows',
                 'mobile': False
             },
