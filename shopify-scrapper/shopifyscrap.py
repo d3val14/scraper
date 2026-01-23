@@ -88,6 +88,7 @@ def process_product(url: str, writer, seen: set):
 
     tags = product.get("tags", [])
     category, category_url = extract_category(tags)
+    category = product.get("type", "")
 
     brand = product.get("vendor", "")
     product_name = product.get("title", "")
@@ -97,7 +98,7 @@ def process_product(url: str, writer, seen: set):
 
     for v in product["variants"]:
         row = [
-            product_url,                        # Ref Product URL
+            f"{product_url}?variant={v.get('id', '')}",  # Ref Product URL
             product_id,                         # Ref Product ID
             v.get("id", ""),                    # Ref Varient ID
             category,                           # Ref Category
