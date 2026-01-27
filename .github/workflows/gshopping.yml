@@ -4,367 +4,127 @@ on:
   workflow_dispatch:
     inputs:
       input_filename:
-        description: 'Input CSV filename on FTP'
+        description: "Input CSV filename on FTP"
         required: true
-        default: 'google_shopping.csv'
-        type: string
+        default: "google_shopping.csv"
       total_chunks:
-        description: 'Number of chunks to split into'
+        description: "Number of chunks"
         required: true
-        default: '4'
-        type: string
+        default: "4"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      matrix: ${{ steps.gen.outputs.matrix }}
     steps:
-      - id: matrix
+      - id: gen
         run: |
-          TOTAL_CHUNKS=${{ github.event.inputs.total_chunks || 4 }}
-          
-          # Create matrix array
+          TOTAL=${{ github.event.inputs.total_chunks }}
+
           MATRIX="["
-          for ((i=1;i<=TOTAL_CHUNKS;i++)); do
+          for ((i=1;i<=TOTAL;i++)); do
             MATRIX+="{\"chunk_id\":$i},"
           done
           MATRIX="${MATRIX%,}]"
-          
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total chunks: $TOTAL_CHUNKS"
-          echo "Matrix: $MATRIX"
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   scrape:
     needs: plan
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-    
+
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
-    
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      
-      - name: Install system dependencies
+
+      - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             google-chrome-stable \
             chromium-chromedriver \
-            ffmpeg \
-            pulseaudio \
             xvfb \
             lftp
-      
-      - name: Install Python dependencies
+
+      - name: Install python deps
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            selenium==4.18.1 \
-            undetected-chromedriver==3.5.4 \
-            pandas==2.1.4 \
-            beautifulsoup4==4.12.2 \
-            requests==2.31.0 \
-            lxml==4.9.3 \
-            pydub==0.25.1 \
-            fake-useragent==1.4.0 \
-            python-dateutil==2.8.2 \
-            SpeechRecognition==3.10.0
-      
+          pip install pandas==2.1.4
+
       - name: Run scraper
         env:
           DISPLAY: :99
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_PORT: ${{ secrets.FTP_PORT }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_PATH: ${{ secrets.FTP_PATH }}
         run: |
-          # Start Xvfb for headless browser
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 3
-          
-          # Get input parameters
-          INPUT_FILE="${{ github.event.inputs.input_filename || 'google_shopping.csv' }}"
-          TOTAL_CHUNKS="${{ github.event.inputs.total_chunks || 4 }}"
-          
-          echo "========================================"
-          echo "Google Shopping Scraper"
-          echo "========================================"
-          echo "Chunk ID: ${{ matrix.chunk_id }}"
-          echo "Total Chunks: $TOTAL_CHUNKS"
-          echo "Input File: $INPUT_FILE"
-          echo "FTP Path: $FTP_PATH"
-          echo "========================================"
-          
-          # Run the scraper directly from gshopping folder
+
           python gshopping/gscrapperci.py \
             --chunk-id ${{ matrix.chunk_id }} \
-            --total-chunks $TOTAL_CHUNKS \
-            --input-file "$INPUT_FILE"
-      
-      - name: Upload chunk results
+            --total-chunks ${{ github.event.inputs.total_chunks }} \
+            --input-file "${{ github.event.inputs.input_filename }}"
+
+      - name: Upload chunk output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: chunk-${{ matrix.chunk_id }}
-          path: |
-            output/
-          retention-days: 1
+          path: output/
 
   merge:
     needs: scrape
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      
-      - name: Install pandas for merging
+
+      - name: Install pandas
         run: |
           python -m pip install --upgrade pip
           pip install pandas==2.1.4
-      
-      - name: Download all artifacts
+
+      - name: Download chunks
         uses: actions/download-artifact@v4
         with:
           path: chunks
-      
-      - name: Merge CSV files
-        env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_PATH: ${{ secrets.FTP_PATH }}
-        run: |
-          # Create Python script to merge results
-          cat > merge_results.py << 'EOF'
-          import os
-          import pandas as pd
-          from datetime import datetime
-          
-          print("Starting merge process...")
-          
-          # Find all CSV files
-          product_files = []
-          seller_files = []
-          
-          for root, dirs, files in os.walk('chunks'):
-              for file in files:
-                  filepath = os.path.join(root, file)
-                  if 'product_info' in file and file.endswith('.csv'):
-                      product_files.append(filepath)
-                  elif 'seller_info' in file and file.endswith('.csv'):
-                      seller_files.append(filepath)
-          
-          print(f"Found {len(product_files)} product files")
-          print(f"Found {len(seller_files)} seller files")
-          
-          # Merge product files
-          if product_files:
-              print("\nMerging product files...")
-              product_dfs = []
-              for f in product_files:
-                  try:
-                      df = pd.read_csv(f)
-                      product_dfs.append(df)
-                      print(f"  ✓ {os.path.basename(f)}: {len(df)} rows")
-                  except Exception as e:
-                      print(f"  ✗ Error loading {f}: {e}")
-              
-              if product_dfs:
-                  merged_products = pd.concat(product_dfs, ignore_index=True)
-                  merged_products = merged_products.sort_values('product_id')
-                  
-                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                  merged_product_file = f'merged_products_{timestamp}.csv'
-                  merged_products.to_csv(merged_product_file, index=False)
-                  
-                  print(f"\n✓ Saved merged products: {merged_product_file}")
-                  print(f"  Total rows: {len(merged_products)}")
-                  
-                  # Calculate summary
-                  completed = len(merged_products[merged_products['status'] == 'completed'])
-                  errors = len(merged_products[merged_products['status'] == 'error'])
-                  with_osb = len(merged_products[merged_products['osb_position'] > 0])
-                  
-                  print(f"\nSummary:")
-                  print(f"  Completed: {completed}")
-                  print(f"  Errors: {errors}")
-                  print(f"  With OSB position: {with_osb}")
-          
-          # Merge seller files
-          if seller_files:
-              print("\nMerging seller files...")
-              seller_dfs = []
-              for f in seller_files:
-                  try:
-                      df = pd.read_csv(f)
-                      seller_dfs.append(df)
-                      print(f"  ✓ {os.path.basename(f)}: {len(df)} rows")
-                  except Exception as e:
-                      print(f"  ✗ Error loading {f}: {e}")
-              
-              if seller_dfs:
-                  merged_sellers = pd.concat(seller_dfs, ignore_index=True)
-                  merged_sellers = merged_sellers.sort_values(['product_id', 'seller'])
-                  
-                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                  merged_seller_file = f'merged_sellers_{timestamp}.csv'
-                  merged_sellers.to_csv(merged_seller_file, index=False)
-                  
-                  print(f"\n✓ Saved merged sellers: {merged_seller_file}")
-                  print(f"  Total rows: {len(merged_sellers)}")
-          
-          print("\n✓ Merge completed!")
-          EOF
-          
-          python merge_results.py
-      
-      - name: Upload merged files to FTP
-        env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_PATH: ${{ secrets.FTP_PATH }}
-        run: |
-          # Install lftp if not already installed
-          sudo apt-get update && sudo apt-get install -y lftp
-          
-          echo "Uploading merged files to FTP..."
-          
-          # Upload merged products
-          if ls merged_products_*.csv 1> /dev/null 2>&1; then
-            PRODUCT_FILE=$(ls merged_products_*.csv | head -1)
-            echo "Uploading $PRODUCT_FILE..."
-            
-            # Create lftp script
-                        cat > /tmp/lftp_script.lftp << 'LFTP_SCRIPT'
-            set ftp:ssl-allow no
-            open ${{ secrets.FTP_HOST }}
-            user ${{ secrets.FTP_USER }} ${{ secrets.FTP_PASS }}
-            mkdir -p ${{ secrets.FTP_PATH }}
-            cd ${{ secrets.FTP_PATH }}
-            put $PRODUCT_FILE
-            bye
-            LFTP_SCRIPT
-                        
-                        lftp -f /tmp/lftp_script.lftp
-                        
-                        if [ $? -eq 0 ]; then
-                          echo "✓ Uploaded $PRODUCT_FILE to FTP"
-                        else
-                          echo "✗ Failed to upload $PRODUCT_FILE to FTP"
-                        fi
-                        
-                        rm -f /tmp/lftp_script.lftp
-                      else
-                        echo "No product file to upload"
-                      fi
-                      
-                      # Upload merged sellers
-                      if ls merged_sellers_*.csv 1> /dev/null 2>&1; then
-                        SELLER_FILE=$(ls merged_sellers_*.csv | head -1)
-                        echo "Uploading $SELLER_FILE..."
-                        
-                        # Create lftp script
-                                    cat > /tmp/lftp_script2.lftp << LFTP_SCRIPT2
-            set ftp:ssl-allow no
-            open ${{ secrets.FTP_HOST }}
-            user ${{ secrets.FTP_USER }} ${{ secrets.FTP_PASS }}
-            mkdir -p ${{ secrets.FTP_PATH }}
-            cd ${{ secrets.FTP_PATH }}
-            put $SELLER_FILE
-            bye
-            LFTP_SCRIPT2
-                        
-                        lftp -f /tmp/lftp_script2.lftp
-                        
-                        if [ $? -eq 0 ]; then
-                          echo "✓ Uploaded $SELLER_FILE to FTP"
-                        else
-                          echo "✗ Failed to upload $SELLER_FILE to FTP"
-                        fi
-                        
-                        rm -f /tmp/lftp_script2.lftp
-                      else
-                        echo "No seller file to upload"
-                      fi
-      
-      - name: Upload merged results as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: merged-scraping-results
-          path: |
-            merged_products_*.csv
-            merged_sellers_*.csv
-          retention-days: 7
 
-  notify:
-    runs-on: ubuntu-latest
-    needs: [scrape, merge]
-    if: always()
-    
-    steps:
-      - name: Download merged results
-        uses: actions/download-artifact@v4
-        with:
-          name: merged-scraping-results
-      
-      - name: Generate summary
+      - name: Merge CSV files
         run: |
-          echo "=== SCRAPING RESULTS SUMMARY ==="
-          echo ""
-          
-          # Count product rows
-          if ls merged_products_*.csv 1> /dev/null 2>&1; then
-            PRODUCT_FILE=$(ls merged_products_*.csv | head -1)
-            PRODUCT_COUNT=$(tail -n +2 "$PRODUCT_FILE" 2>/dev/null | wc -l || echo "0")
-            echo "Total Products Scraped: $PRODUCT_COUNT"
-            
-            # Get some stats if we have Python
-            python3 << 'EOF'
-          import pandas as pd
-          import glob
-          
-          product_files = glob.glob('merged_products_*.csv')
-          if product_files:
-              df = pd.read_csv(product_files[0])
-              print(f"Successfully scraped: {len(df[df['status'] == 'completed'])}")
-              print(f"Failed scrapes: {len(df[df['status'] == 'error'])}")
-              print(f"With OSB position: {len(df[df['osb_position'] > 0])}")
-          EOF
-          else
-            echo "Total Products Scraped: 0"
-          fi
-          
-          echo ""
-          
-          # Count seller rows
-          if ls merged_sellers_*.csv 1> /dev/null 2>&1; then
-            SELLER_FILE=$(ls merged_sellers_*.csv | head -1)
-            SELLER_COUNT=$(tail -n +2 "$SELLER_FILE" 2>/dev/null | wc -l || echo "0")
-            echo "Total Sellers Found: $SELLER_COUNT"
-          else
-            echo "Total Sellers Found: 0"
-          fi
-          
-          echo ""
-          echo "========================================"
-          echo "Workflow completed at: $(date)"
-          echo "GitHub Run ID: $GITHUB_RUN_ID"
-          echo "GitHub Run URL: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          python scripts/merge_results.py
+
+      - name: Upload merged CSVs to FTP
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_PATH: ${{ secrets.FTP_PATH }}
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y lftp
+
+          for file in merged_products_*.csv merged_sellers_*.csv; do
+            [ -f "$file" ] || continue
+            echo "Uploading $file"
+
+            lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" -e "
+              set ftp:ssl-allow no
+              mkdir -p $FTP_PATH
+              cd $FTP_PATH
+              put $file
+              bye
+            "
+          done
