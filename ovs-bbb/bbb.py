@@ -41,52 +41,6 @@ def setup_logging(chunk_id: int):
     )
     return logging.getLogger(__name__)
 
-# ================= HTTP SESSION =================
-
-def create_session():
-    """Create and configure HTTP session with better timeout settings"""
-    session = requests.Session()
-    # Use a more realistic user agent
-    session.headers.update({
-        # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        # "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-    })
-    
-    # # Increase adapter pool size and timeout
-    # adapter = requests.adapters.HTTPAdapter(
-    #     pool_connections=20,
-    #     pool_maxsize=100,
-    #     max_retries=3,
-    #     pool_block=False
-    # )
-    # session.mount('https://', adapter)
-    # session.mount('http://', adapter)
-    
-    return session
-
-session = requests.Session()
-# Add default headers to session for all requests
-session.headers.update({
-    # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    # "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-})
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -94,49 +48,6 @@ session.headers.update({
                                   requests.exceptions.ConnectionError,
                                   requests.exceptions.ChunkedEncodingError))
 )
-# def http_get_with_retry(session, url: str) -> Optional[str]:
-#     """HTTP GET request with retry logic"""
-#     try:
-#         # Use shorter timeout for initial request
-#         r = session.get(url, timeout=(5, 10), verify=False)
-        
-#         if r.status_code == 200:
-#             return r.text
-#         elif r.status_code == 404:
-#             logger.warning(f"404 Not Found for {url}")
-#             return None
-#         elif r.status_code == 429:  # Rate limited
-#             logger.warning(f"Rate limited (429) for {url}")
-#             time.sleep(10)  # Longer wait for rate limiting
-#             raise requests.exceptions.RetryError("Rate limited")
-#         elif r.status_code == 403:
-#             logger.warning(f"Access forbidden (403) for {url}")
-#             return None
-#         elif r.status_code >= 500:
-#             logger.warning(f"Server error {r.status_code} for {url}")
-#             time.sleep(2)
-#             raise requests.exceptions.RetryError(f"Server error {r.status_code}")
-#         else:
-#             logger.warning(f"HTTP {r.status_code} for {url}")
-#             return None
-            
-#     except requests.exceptions.Timeout:
-#         logger.warning(f"Timeout for {url}")
-#         raise  # This will trigger retry
-#     except requests.exceptions.ConnectionError:
-#         logger.warning(f"Connection error for {url}")
-#         raise  # This will trigger retry
-#     except Exception as e:
-#         logger.warning(f"Error for {url}: {type(e).__name__}")
-#         return None
-
-# def http_get(session, url: str) -> Optional[str]:
-#     """HTTP GET request with better error handling"""
-#     try:
-#         return http_get_with_retry(session, url)
-#     except Exception as e:
-#         logger.warning(f"All retries failed for {url}: {type(e).__name__}")
-#         return None
 
 def fetch_json(api_url: str) -> Optional[dict]:
     response = requests.get(api_url, timeout=10)
@@ -229,7 +140,7 @@ def extract_bbb_data(variant_data: dict) -> Dict[str, Any]:
         logger.error(f"Error extracting BBB data: {e}")
         return {}
 
-def process_variant_data(variant_id: str, session, stats: dict, request_delay: float = 1.0) -> Dict[str, Any]:
+def process_variant_data(variant_id: str, stats: dict, request_delay: float = 1.0) -> Dict[str, Any]:
     """Process a single BBB variant ID"""
     try:
         if not variant_id or pd.isna(variant_id):
@@ -276,12 +187,12 @@ def process_variant_data(variant_id: str, session, stats: dict, request_delay: f
                 'BBB_Description': '',
                 'BBB_Dimensions': '',
                 'BBB_Attributes': '',
-                'BBB_Attributes_Count': '',
-                'BBB_AttributeIcons_Count': '',
-                'BBB_AttributeIcons_URLs': '',
-                'BBB_AttributeIcons_Names': '',
-                'BBB_Error': 'No data found or timeout',
-                'BBB_API_Response': ''
+                # 'BBB_Attributes_Count': '',
+                # 'BBB_AttributeIcons_Count': '',
+                # 'BBB_AttributeIcons_URLs': '',
+                # 'BBB_AttributeIcons_Names': '',
+                # 'BBB_Error': 'No data found or timeout',
+                # 'BBB_API_Response': ''
             }
         
         # Extract data from response
@@ -295,13 +206,13 @@ def process_variant_data(variant_id: str, session, stats: dict, request_delay: f
             'BBB_OptionId': variant_info.get('BBB_OptionId', ''),
             'BBB_Description': variant_info.get('BBB_Description', ''),
             'BBB_Dimensions': variant_info.get('BBB_Dimensions', ''),
-            'BBB_Attributes': variant_info.get('BBB_Attributes', ''),
-            'BBB_Attributes_Count': variant_info.get('BBB_Attributes_Count', 0),
-            'BBB_AttributeIcons_Count': variant_info.get('BBB_AttributeIcons_Count', 0),
-            'BBB_AttributeIcons_URLs': variant_info.get('BBB_AttributeIcons_URLs', ''),
-            'BBB_AttributeIcons_Names': variant_info.get('BBB_AttributeIcons_Names', ''),
-            'BBB_Error': '',
-            'BBB_API_Response': json.dumps(data) if variant_info else ''
+            'BBB_Attributes': variant_info.get('BBB_Attributes', '')
+            # 'BBB_Attributes_Count': variant_info.get('BBB_Attributes_Count', 0),
+            # 'BBB_AttributeIcons_Count': variant_info.get('BBB_AttributeIcons_Count', 0),
+            # 'BBB_AttributeIcons_URLs': variant_info.get('BBB_AttributeIcons_URLs', ''),
+            # 'BBB_AttributeIcons_Names': variant_info.get('BBB_AttributeIcons_Names', ''),
+            # 'BBB_Error': '',
+            # 'BBB_API_Response': json.dumps(data) if variant_info else ''
         }
         
         stats['processed'] += 1
@@ -322,13 +233,13 @@ def process_variant_data(variant_id: str, session, stats: dict, request_delay: f
             'BBB_OptionId': '',
             'BBB_Description': '',
             'BBB_Dimensions': '',
-            'BBB_Attributes': '',
-            'BBB_Attributes_Count': '',
-            'BBB_AttributeIcons_Count': '',
-            'BBB_AttributeIcons_URLs': '',
-            'BBB_AttributeIcons_Names': '',
-            'BBB_Error': str(e),
-            'BBB_API_Response': ''
+            'BBB_Attributes': ''
+            # 'BBB_Attributes_Count': '',
+            # 'BBB_AttributeIcons_Count': '',
+            # 'BBB_AttributeIcons_URLs': '',
+            # 'BBB_AttributeIcons_Names': '',
+            # 'BBB_Error': str(e),
+            # 'BBB_API_Response': ''
         }
 
 # ================= MAIN FUNCTION =================
@@ -478,7 +389,7 @@ def main():
         logger.info(f"Sample variant IDs: {variant_ids[:10]}")
     
     # Create session
-    session = create_session()
+    # session = create_session()
     
     # Initialize statistics
     stats = {
@@ -506,8 +417,7 @@ def main():
                     
                 future = executor.submit(
                     process_variant_data, 
-                    variant_id, 
-                    session, 
+                    variant_id,
                     stats, 
                     args.request_delay
                 )
@@ -530,7 +440,7 @@ def main():
             time.sleep(5)
     
     # Close session
-    session.close()
+    # session.close()
     
     # Create results DataFrame
     if results:
@@ -545,9 +455,7 @@ def main():
         # Add BBB columns with empty values
         bbb_columns = [
             'BBB_SKU', 'BBB_ModelNumber', 'BBB_OptionId', 'BBB_Description',
-            'BBB_Dimensions', 'BBB_Attributes', 'BBB_Attributes_Count',
-            'BBB_AttributeIcons_Count', 'BBB_AttributeIcons_URLs',
-            'BBB_AttributeIcons_Names', 'BBB_Error', 'BBB_API_Response'
+            'BBB_Dimensions', 'BBB_Attributes',
         ]
         for col in bbb_columns:
             results_df[col] = ''
@@ -561,12 +469,12 @@ def main():
         'BBB_Description',
         'BBB_Dimensions',
         'BBB_Attributes',
-        'BBB_Attributes_Count',
-        'BBB_AttributeIcons_Count',
-        'BBB_AttributeIcons_URLs',
-        'BBB_AttributeIcons_Names',
-        'BBB_Error',
-        'BBB_API_Response'
+        # 'BBB_Attributes_Count',
+        # 'BBB_AttributeIcons_Count',
+        # 'BBB_AttributeIcons_URLs',
+        # 'BBB_AttributeIcons_Names',
+        # 'BBB_Error',
+        # 'BBB_API_Response'
     ]
     
     # Add any missing columns
