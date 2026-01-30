@@ -1,0 +1,13 @@
+# Simple workflow configuration
+workflow:
+    name: "BedBathBeyond Product Fetcher"
+    script: "fetch_simple.py"
+    run_order: 1
+    
+  # API endpoint
+  api_url: "https://api.bedbathandbeyond.com/options/90871997"
+  
+  # Output settings
+  output:
+    csv_file: "product_ids.csv"
+    fields: ["ID", "SKU"]
