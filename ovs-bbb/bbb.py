@@ -157,13 +157,13 @@ def fetch_json(url: str) -> Optional[dict]:
         if r.status_code == 200:
             return r.json()
         else:
-            log(f"JSON fetch failed: {r.status_code} for {url}", "WARNING")
+            logger.warning(f"JSON fetch failed: {r.status_code} for {url}", "WARNING")
             return None
     except json.JSONDecodeError as e:
-        log(f"JSON decode error for {url}: {e}", "ERROR")
+        logger.warning(f"JSON decode error for {url}: {e}", "ERROR")
         return None
     except Exception as e:
-        log(f"Error fetching JSON from {url}: {e}", "ERROR")
+        logger.warning(f"Error fetching JSON from {url}: {e}", "ERROR")
         return None
 
 # ================= DATA PROCESSING =================
