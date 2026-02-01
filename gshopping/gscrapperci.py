@@ -72,8 +72,8 @@ def setup_driver():
     options.add_argument(f"user-agent={random.choice(user_agents)}")
 
     
-    driver = uc.Chrome(options=options)
-    # driver = uc.Chrome(options=options,version_main=144)
+    # driver = uc.Chrome(options=options)
+    driver = uc.Chrome(options=options,version_main=144)
     return driver
 
 def detects_recaptcha(driver):
