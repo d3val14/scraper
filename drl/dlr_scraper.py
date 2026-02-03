@@ -464,7 +464,7 @@ def main():
                         if e.text
                         and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
                         and (
-                            or '.html' in e.text
+                            '.html' in e.text
                         )
                     ]
                     if urls:
