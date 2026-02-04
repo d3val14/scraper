@@ -9,6 +9,7 @@ import re
 import json
 import html
 import ast
+import cloudscraper
 from typing import Optional, List, Dict
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
@@ -37,7 +38,9 @@ def log(msg: str, level: str = "INFO"):
 
 # ================= HTTP SESSION =================
 
-session = requests.Session()
+# session = requests.Session()
+session = cloudscraper.create_scraper()
+# session = scraper.Session()
 # Add default headers to session for all requests
 session.headers.update({
     # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -57,8 +60,9 @@ def get_sitemap_from_robots_txt():
         robots_url = f"{CURR_URL}/robots.txt"
         
         # Fetch the robots.txt content
-        response = requests.get(robots_url, timeout=10)
-        response.raise_for_status()
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(robots_url, timeout=10)
+        # response.raise_for_status()
      
         # Extract Sitemap URL
         sitemap_url = None
@@ -153,29 +157,37 @@ def extract_datalayer(html_text):
 def extract_additional_product_info(html_text):
     try:
         soup = BeautifulSoup(html_text, 'html.parser')
+        table = soup.find('table', id='product-attribute-specs-table')
         
-        container = soup.find('div', class_='Product__additional-container')
-        
-        if not container:
-            container = soup.find('div', class_='data-table')
-            if not container:
-                return json.dumps({})
+        if not table:
+            table = soup.find('table', class_='additional-attributes')
+            if not table:
+                return json.dumps({})  # Return empty JSON object
         
         additional_info = {}
-
-        labels = container.find_all('div', class_='label')
         
-        for label in labels:
-            label_text = label.get_text(strip=True)
+        tbody = table.find('tbody')
+        if tbody:
+            rows = tbody.find_all('tr')
+        else:
+            rows = table.find_all('tr')
+        
+        for row in rows:
+            th = row.find('th')
+            td = row.find('td')
             
-            data_div = label.find_next_sibling('div', class_='data')
-            
-            if data_div:
-                data_text = data_div.get_text(strip=True)
+            if th and td:
+                label_text = th.get_text(strip=True)
+                data_text = td.get_text(strip=True)
+                
                 if label_text and data_text:
+                    # Clean and format the label as a valid JSON key
+                    # Replace spaces with underscores, remove special characters, and make lowercase
                     json_key = re.sub(r'[^a-zA-Z0-9_]', '_', label_text.lower().replace(' ', '_'))
+                    # Remove leading/trailing underscores
+                    json_key = json_key.strip('_')
                     additional_info[json_key] = data_text
-
+        
         return json.dumps(additional_info, ensure_ascii=False)
     except Exception as e:
         print(f"Error while processing additional Data: {e}")
@@ -185,18 +197,24 @@ def fetch_json(url: str) -> Optional[dict]:
     """Fetch JSON data with proper headers"""
     try:
         # Headers specifically for JSON/API requests
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers)
+        # headers = {
+        #     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        # }
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(url)
+        # response = requests.get(url, headers=headers)
         # Look for dataLayer
         html = response.text
         data_layer = extract_datalayer(html)
-        additional_info = extract_additional_product_info(html)
+
         if not data_layer:
             print("No dataLayer found")
             return
         product_data = data_layer[0]
+        if product_data.get("ecommerce", {}).get("isPDP") == 0:
+            print("isPDP is 0, returning early")
+            return None
+        additional_info = extract_additional_product_info(html)
         product_data["additional_product_info_html"] = additional_info
         return product_data
     except Exception as e:
@@ -270,25 +288,44 @@ def extract_product_data(product_data: dict) -> dict:
     """
     try:
         # ---------- Basic ----------
-        product_id = str(product_data.get('magentoProductId', ''))
-        name = product_data.get('magentoProductName', '').strip()
-        sku = product_data.get('magentoProductSku', '')
+        product_id = str(product_data.get('ecomm_prodid', [''])[0] if isinstance(product_data.get('ecomm_prodid'), list) and product_data.get('ecomm_prodid') else '')
+        
+        # Get name from ecommerce items first, then from product section
+        ecommerce_items = product_data.get('ecommerce', {}).get('items', [])
+        name = ''
+        if ecommerce_items:
+            name = ecommerce_items[0].get('item_name', '').strip()
+        if not name:
+            name = product_data.get('product', {}).get('name', '').strip()
+        if not product_id:
+            name = product_data.get('product', {}).get('id', '').strip()
+        
+        sku = product_data.get('ecomm_prodsku', '')
+        if not sku:
+            sku = product_data.get('product', {}).get('sku', '')
         
         # ---------- Brand ----------
-        # Extract brand from ecommerce items
-        ecommerce_items = product_data.get('ecommerce', {}).get('items', [])
         brand = ''
         quantity = 0
+        price = ''
+        
         if ecommerce_items:
             brand = ecommerce_items[0].get('item_brand', '')
-            quantity = ecommerce_items[0].get('quantity', '')
+            quantity = ecommerce_items[0].get('quantity', 0)
+            price_item = ecommerce_items[0].get('price', '')
+            if price_item:
+                price = str(price_item)
         
         # ---------- Price ----------
-        price = product_data.get('magentoProductPrice', '')
+        # Use ecommerce value if price not found in items
+        if not price:
+            ecomm_value = product_data.get('ecommerce', {}).get('value', '')
+            if ecomm_value:
+                price = str(ecomm_value)
         
         # ---------- Main Image ----------
-        main_image = product_data.get('magentoProductImage1', '')
-
+        main_image = ''
+        
         # ---------- Additional Info ----------
         additional_data = product_data.get('additional_product_info_html', '')
         mpn = sku
@@ -322,12 +359,11 @@ def extract_product_data(product_data: dict) -> dict:
                 category = ' | '.join(categories)
         
         # ---------- Stock Status ----------
-        availability = product_data.get('magentoProductAvailability', '')
+        availability = product_data.get('ecommerce', {}).get('magentoProductAvailability', '')
         status = 'OUT_OF_STOCK'
         
         if availability == 'InStock':
             status = 'SELLABLE'
-
         
         # ---------- Variation ID ----------
         # Use product ID as variation ID since no separate variation field
@@ -336,9 +372,6 @@ def extract_product_data(product_data: dict) -> dict:
         # ---------- Additional Attributes ----------
         group_attr_1 = ''
         group_attr_2 = ''
-        
-        # Could use some product name parts or other fields if needed
-        # For now leaving empty as not specified in JSON
         
         return {
             'product_id': product_id,
@@ -454,7 +487,7 @@ def main():
         elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
         if elements:
             sitemaps = [e.text.strip() for e in elements 
-            if e.text and "product" in e.text.lower()]
+            if e.text ]
             break
     
     # If still no sitemaps, try regex
