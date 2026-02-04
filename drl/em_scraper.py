@@ -42,18 +42,18 @@ def log(msg: str, level: str = "INFO"):
 session = cloudscraper.create_scraper()
 # session = scraper.Session()
 # Add default headers to session for all requests
-session.headers.update({
-    # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    # "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-})
+# session.headers.update({
+#     # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+#     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+#     "Accept-Language": "en-US,en;q=0.9",
+#     # "Accept-Encoding": "gzip, deflate, br",
+#     "Connection": "keep-alive",
+#     "Upgrade-Insecure-Requests": "1",
+#     "Sec-Fetch-Dest": "document",
+#     "Sec-Fetch-Mode": "navigate",
+#     "Sec-Fetch-Site": "none",
+#     "Sec-Fetch-User": "?1",
+# })
 def get_sitemap_from_robots_txt():
     try:
         # Construct robots.txt URL
@@ -98,10 +98,10 @@ def http_get(url: str, is_json: bool = False) -> Optional[str]:
                     "Sec-Fetch-Mode": "cors",
                     "Sec-Fetch-Site": "same-origin",
                 }
-                r = session.get(url, headers=headers, timeout=15, verify=True)
+                r = session.get(url)
             else:
                 # For sitemap/XML requests, use default session headers (already set)
-                r = session.get(url, timeout=15, verify=True)
+                r = session.get(url)
                 
             if r.status_code == 200:
                 log(f"Success fetching {url}", "DEBUG")
