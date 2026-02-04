@@ -10,6 +10,7 @@ import json
 import html
 import ast
 from typing import Optional, List, Dict
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -149,6 +150,32 @@ def extract_datalayer(html_text):
     # 🔥 Clean ALL strings at source
     return _clean_strings(data)
 
+def extract_additional_product_info(html_text):
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    container = soup.find('div', class_='Product__additional-container')
+    
+    if not container:
+        container = soup.find('div', class_='data-table')
+        if not container:
+            return json.dumps({})
+    
+    additional_info = {}
+
+    labels = container.find_all('div', class_='label')
+    
+    for label in labels:
+        label_text = label.get_text(strip=True)
+        
+        data_div = label.find_next_sibling('div', class_='data')
+        
+        if data_div:
+            data_text = data_div.get_text(strip=True)
+            if label_text and data_text:
+                json_key = re.sub(r'[^a-zA-Z0-9_]', '_', label_text.lower().replace(' ', '_'))
+                additional_info[json_key] = data_text
+                
+    return json.dumps(additional_info, ensure_ascii=False)
 
 def fetch_json(url: str) -> Optional[dict]:
     """Fetch JSON data with proper headers"""
@@ -161,10 +188,12 @@ def fetch_json(url: str) -> Optional[dict]:
         # Look for dataLayer
         html = response.text
         data_layer = extract_datalayer(html)
+        additional_info = extract_additional_product_info(html)
         if not data_layer:
             print("No dataLayer found")
             return
         product_data = data_layer[0]
+        product_data["additional_product_info_html"] = additional_info
         return product_data
     except Exception as e:
         print(f"Error fetching JSON: {e}")
@@ -363,6 +392,7 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
             product_info['group_attr_1'],  # Ref Group Attr 1
             product_info['group_attr_2'],  # Ref Group Attr 2
             product_info['status'],  # Ref Status
+            product_info['additional_product_info_html'],  #additional Data
             SCRAPED_DATE  # Date Scrapped
         ]
         
@@ -453,6 +483,7 @@ def main():
             "Ref Group Attr 1",
             "Ref Group Attr 2",
             "Ref Status",
+            "Additional Product Data",
             "Date Scrapped"
         ])
         
