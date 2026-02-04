@@ -302,8 +302,6 @@ def extract_product_data(product_data: dict) -> dict:
         
         
         # ---------- Category ----------
-        # Get category from ecommerce items
-        category = ''
         category_url = ''
         
         if ecommerce_items and not category:
