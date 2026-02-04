@@ -357,6 +357,7 @@ def extract_overstock_data(product_data: dict, product_url: str) -> List[Dict]:
             # Single product or no variations
             variation_id = ''
             quantity = ''
+            price = ''
             status = 'Out of Stock'
             group_attr_1_current = group_attr_1
             
