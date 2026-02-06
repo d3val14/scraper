@@ -342,8 +342,10 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
 def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
     data = http_get(url, crawl_delay)
     if not data:
+        print('data not fetched')
         return None
     try:
+        print(data)
         data_layer = extract_datalayer(data)
         if not data_layer:
             print("No dataLayer found")
