@@ -344,7 +344,17 @@ def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
     if not data:
         return None
     try:
-        return json.loads(data)
+        data_layer = extract_datalayer(data)
+        if not data_layer:
+            print("No dataLayer found")
+            return
+        product_data = data_layer[0]
+        if product_data.get("ecommerce", {}).get("isPDP") == 0:
+            print("isPDP is 0, returning early")
+            return None
+        additional_info = extract_additional_product_info(html)
+        product_data["additional_product_info_html"] = additional_info
+        return product_data
     except json.JSONDecodeError as e:
         log(f"JSON decode error for {url}: {e}")
         return None
@@ -362,18 +372,18 @@ def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
 #         # response = requests.get(url, headers=headers)
 #         # Look for dataLayer
 #         html = response.text
-#         data_layer = extract_datalayer(html)
+        # data_layer = extract_datalayer(html)
 
-#         if not data_layer:
-#             print("No dataLayer found")
-#             return
-#         product_data = data_layer[0]
-#         if product_data.get("ecommerce", {}).get("isPDP") == 0:
-#             print("isPDP is 0, returning early")
-#             return None
-#         additional_info = extract_additional_product_info(html)
-#         product_data["additional_product_info_html"] = additional_info
-#         return product_data
+        # if not data_layer:
+        #     print("No dataLayer found")
+        #     return
+        # product_data = data_layer[0]
+        # if product_data.get("ecommerce", {}).get("isPDP") == 0:
+        #     print("isPDP is 0, returning early")
+        #     return None
+        # additional_info = extract_additional_product_info(html)
+        # product_data["additional_product_info_html"] = additional_info
+        # return product_data
 #     except Exception as e:
 #         print(f"Error fetching JSON: {e}")
 #         return None
