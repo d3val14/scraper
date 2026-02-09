@@ -99,7 +99,7 @@ def detects_recaptcha(driver):
 
 def handle_captcha(driver, url):
     """Handle captcha if detected with retry logic"""
-    max_retries = 3
+    max_retries = 1
 
     for attempt in range(max_retries):
         recaptcha = detects_recaptcha(driver)
