@@ -241,7 +241,7 @@ class RequestManager:
         self.request_count += 1
         
         if self.request_count % 20 == 0:
-            long_pause = random.uniform(8, 15)
+            long_pause = random.uniform(0, 1)
             log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
             time.sleep(long_pause)
     
@@ -581,6 +581,7 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl
 
 def main():
     crawl_delay, robots_sitemap = check_robots_txt()
+    crawl_delay = 0
     sitemap = SITEMAP_INDEX
     if robots_sitemap and robots_sitemap.startswith('http'):
         sitemap = robots_sitemap
@@ -679,11 +680,11 @@ def main():
             log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
             
             # Check if this sitemap contains product pages before processing
-            if not check_sitemap_contains_products(sitemap_url, crawl_delay):
-                log(f"Sitemap {sitemap_url} contains no product pages. Skipping and continuing...", "WARNING")
-                log("NOTE: This might indicate the entire sitemap index has no product pages.")
-                log("Consider checking the sitemap structure or stopping the process.")
-                continue
+            # if not check_sitemap_contains_products(sitemap_url, crawl_delay):
+            #     log(f"Sitemap {sitemap_url} contains no product pages. Skipping and continuing...", "WARNING")
+            #     log("NOTE: This might indicate the entire sitemap index has no product pages.")
+            #     log("Consider checking the sitemap structure or stopping the process.")
+            #     continue
             
             xml = load_xml(sitemap_url, crawl_delay)
             if not xml:
