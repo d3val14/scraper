@@ -139,7 +139,7 @@ jobs:
           echo "FLARESOLVERR_URL: $FLARESOLVERR_URL"
           echo ""
           
-          python em_scraper.py || echo "Scraper failed with exit code $?"
+          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
           
           echo ""
           echo "Generated files:"
