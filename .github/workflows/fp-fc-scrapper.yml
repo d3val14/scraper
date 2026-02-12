@@ -1,4 +1,4 @@
-name: Emma Mason Scraper
+name: FP FC Scraper
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       url:
         description: "Base site URL"
         required: true
-        default: "https://www.emmamason.com"
+        default: "https://www.furniturepick.com"
       total_sitemaps:
         description: "Total sitemaps to process (0 = auto)"
         default: "0"
@@ -89,7 +89,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 cloudscraper curl-cffi lxml
 
-      - name: Run Emma Mason scraper
+      - name: Run FP FC scraper
         id: scrape_run
         continue-on-error: true  # Continue even if this step fails
         env:
@@ -101,7 +101,7 @@ jobs:
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
         run: |
-          echo "Starting Emma Mason scraper with configuration:"
+          echo "Starting FP FC scraper with configuration:"
           echo "CURR_URL: $CURR_URL"
           echo "SITEMAP_INDEX: $SITEMAP_INDEX"
           echo "SITEMAP_OFFSET: $SITEMAP_OFFSET"
@@ -111,8 +111,8 @@ jobs:
           echo "REQUEST_DELAY: $REQUEST_DELAY"
           echo ""
           
-          # Run the Emma Mason scraper
-          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
+          # Run the FP FC scraper
+          python fpfc/fp_fc_scraper.py || echo "Scraper failed with exit code $?"
           
           # List output files
           echo ""
@@ -205,7 +205,7 @@ jobs:
         run: |
           SITE_NAME="${{ needs.plan.outputs.site_name }}"
           if [ -z "$SITE_NAME" ]; then
-            SITE_NAME="emma_mason"
+            SITE_NAME="fp_fc"
           fi
           DATE=$(date +%F_%H%M%S)
           echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
