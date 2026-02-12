@@ -157,17 +157,17 @@ jobs:
           
           # Add connection test in Python
           python -c "
-import requests
-import sys
-try:
-    r = requests.post('http://localhost:8191/v1', 
-                     json={'cmd': 'sessions.list'}, 
-                     timeout=10)
-    print(f'✓ FlareSolverr connection test: {r.status_code}')
-    sys.exit(0)
-except Exception as e:
-    print(f'✗ FlareSolverr connection failed: {e}')
-    sys.exit(1)
+          import requests
+          import sys
+          try:
+              r = requests.post('http://localhost:8191/v1', 
+                              json={'cmd': 'sessions.list'}, 
+                              timeout=10)
+              print(f'✓ FlareSolverr connection test: {r.status_code}')
+              sys.exit(0)
+          except Exception as e:
+              print(f'✗ FlareSolverr connection failed: {e}')
+              sys.exit(1)
           "
           
           python drl/em_scraper.py || echo "Scraper failed with exit code $?"
