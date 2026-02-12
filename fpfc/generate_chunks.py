@@ -11,6 +11,7 @@ import json
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List, Dict, Tuple
 from xml.etree import ElementTree as ET
 
 # ---------- ENV ----------
