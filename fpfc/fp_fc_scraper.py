@@ -278,7 +278,8 @@ def _clean_strings(obj):
 
 def extract_datalayer(html_text):
     patterns = [
-        r'dataLayer\.push\s*\(\s*(\{[\s\S]*?\})\s*\);',
+        # r'dataLayer\.push\s*\(\s*(\{[\s\S]*?\})\s*\);',
+         r'gtag\s*\(\s*[\'"]event[\'"]\s*,\s*[\'"][^\'"]+[\'"]\s*,\s*(\{[\s\S]*?\})\s*\)\s*;?',
     ]
     
     raw = None
@@ -353,96 +354,6 @@ def extract_additional_product_info(html_text):
         print(f"Error while processing additional Data: {e}")
         return json.dumps({})
 
-def fetch_json(url: str, crawl_delay=None, check_is_pdp_only: bool = False) -> Optional[dict]:
-    """
-    Fetch JSON data with optional isPDP check only.
-    If check_is_pdp_only is True, returns minimal dict with isPDP flag.
-    """
-    data = http_get(url, crawl_delay)
-    if not data:
-        print('data not fetched for json')
-        return None
-    try:
-        data_layer = extract_datalayer(data)
-        if not data_layer:
-            print("No dataLayer found")
-            return None
-        
-        product_data = data_layer[0] if isinstance(data_layer, list) else data_layer
-        is_pdp = product_data.get("ecommerce", {}).get("isPDP", None)
-        
-        if check_is_pdp_only:
-            return {"isPDP": is_pdp}
-        
-        if is_pdp == 0:
-            print(f"isPDP is 0 for {url}, returning early")
-            return None
-            
-        additional_info = extract_additional_product_info(data)
-        product_data["additional_product_info_html"] = additional_info
-        return product_data
-    except json.JSONDecodeError as e:
-        log(f"JSON decode error for {url}: {e}")
-        return None
-    except Exception as e:
-        log(f"Error processing data for {url}: {e}")
-        return None
-
-def check_sitemap_contains_products(sitemap_url: str, crawl_delay=None) -> bool:
-    """
-    Check if a sitemap contains any product pages by sampling URLs.
-    Returns True if at least one URL has isPDP != 0, False otherwise.
-    """
-    log(f"Checking sitemap for product pages: {sitemap_url}")
-    
-    xml = load_xml(sitemap_url, crawl_delay)
-    if not xml:
-        log(f"Failed to load sitemap for checking: {sitemap_url}", "ERROR")
-        return False
-    
-    ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    urls = []
-    for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
-        elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
-        if elements:
-            urls = [
-                e.text.strip()
-                for e in elements
-                if e.text
-                and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
-                and ('.html' in e.text)
-            ]
-            if urls:
-                break
-    
-    if not urls:
-        log(f"No valid URLs found in sitemap for checking", "WARNING")
-        return False
-    
-    sample_size = min(SAMPLE_SIZE, len(urls))
-    sample_urls = random.sample(urls, sample_size) if len(urls) > sample_size else urls
-    
-    log(f"Sampling {sample_size} URLs from sitemap to check for product pages")
-    
-    products_found = 0
-    for i, url in enumerate(sample_urls):
-        log(f"  Checking sample {i+1}/{sample_size}: {url}")
-        
-        data = fetch_json(url, crawl_delay, check_is_pdp_only=True)
-        if data and data.get("isPDP", 0) != 0:
-            products_found += 1
-            log(f"  ✓ Found product page (isPDP != 0)")
-        else:
-            log(f"  ✗ Not a product page (isPDP == 0 or no data)")
-        
-        time.sleep(0.5)
-    
-    if products_found > 0:
-        log(f"Sitemap contains product pages ({products_found}/{sample_size} samples are products)")
-        return True
-    else:
-        log(f"Sitemap appears to have NO product pages (0/{sample_size} samples are products)")
-        return False
 
 csv_lock = threading.Lock()
 
@@ -552,59 +463,237 @@ def extract_product_data(product_data: dict) -> dict:
     except Exception as e:
         print(f"Error extracting product data: {e}")
         return {}
+def extract_product_info_from_html(html: str, product_url: str) -> dict:
+    """
+    Parse product HTML and return a dictionary with all required fields.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    info = {}
+
+    # --- product_id ---
+    prod_input = soup.find('input', {'name': 'product'})
+    info['product_id'] = prod_input.get('value', '') if prod_input else ''
+
+    # --- sku & variation_id ---
+    sku_meta = soup.find('meta', {'itemprop': 'sku'})
+    info['sku'] = sku_meta.get('content', '') if sku_meta else ''
+    # Use the SKU as the variation ID for this bundle configuration
+    info['variation_id'] = info['sku']
+
+    # --- mpn ---
+    mpn_meta = soup.find('meta', {'itemprop': 'mpn'})
+    info['mpn'] = mpn_meta.get('content', '') if mpn_meta else ''
+
+    # --- name ---
+    name_h1 = soup.find('h1', {'itemprop': 'name'})
+    info['name'] = name_h1.get_text(strip=True) if name_h1 else ''
+
+    # --- brand ---
+    brand_meta = soup.find('meta', {'itemprop': 'brand'})
+    if brand_meta:
+        info['brand'] = brand_meta.get('content', '')
+    else:
+        brand_link = soup.find('a', href=lambda h: h and '/brand/' in h)
+        info['brand'] = brand_link.get_text(strip=True) if brand_link else ''
+
+    # --- category & category_url (from breadcrumbs) ---
+    info['category'] = ''
+    info['category_url'] = ''
+    breadcrumbs = soup.find('div', class_='breadcrumbs')
+    if breadcrumbs:
+        crumbs = breadcrumbs.find_all('li')
+        # Home (0), Bedroom (1), Bedroom Furniture (2), Bedroom Sets (3)
+        if len(crumbs) >= 4:
+            cat_li = crumbs[3]
+            cat_link = cat_li.find('a')
+            if cat_link:
+                info['category'] = cat_link.find('span').get_text(strip=True)
+                info['category_url'] = cat_link.get('href', '')
+
+    # --- price ---
+    price_meta = soup.find('meta', {'itemprop': 'price'})
+    if price_meta:
+        info['price'] = price_meta.get('content', '').strip()
+    else:
+        price_span = soup.find('span', {'class': 'price', 'id': re.compile(r'product-price-\d+')})
+        if price_span:
+            raw = price_span.get_text(strip=True).replace('$', '').replace(',', '')
+            info['price'] = raw.strip()
+        else:
+            info['price'] = ''
+
+    # --- main_image (full size) ---
+    img_meta = soup.find('meta', {'itemprop': 'image'})
+    if img_meta:
+        info['main_image'] = img_meta.get('content', '')
+    else:
+        img_main = soup.find('img', {'id': 'image-main'})
+        info['main_image'] = img_main.get('src', '') if img_main else ''
+
+    # --- quantity (global) ---
+    qty_input = soup.find('input', {'id': 'qty-input'})
+    info['quantity'] = qty_input.get('value', '1') if qty_input else '1'
+
+    # --- group_attr_1: selected bed size ---
+    bed_size = ''
+    # Look for the active Queen bed option (adjust class if King is selected)
+    active_bed = soup.find('li', class_='option-item-209551 selection-item-263524 active')
+    if active_bed:
+        text = active_bed.get_text()
+        match = re.search(r'\(([^)]+)\)', text)
+        if match:
+            bed_size = match.group(1)
+    info['group_attr_1'] = bed_size
+
+    # --- group_attr_2: color ---
+    color = ''
+    # Try from the "Additional Information" panel first
+    add_info = soup.find('div', class_='product-details')
+    if add_info:
+        for li in add_info.find_all('li', class_='clearer'):
+            title_div = li.find('div', class_='title')
+            if title_div and 'Color' in title_div.get_text():
+                desc_div = li.find('div', class_='description')
+                if desc_div:
+                    color = desc_div.get_text(strip=True)
+                    break
+    if not color:
+        # Fallback: look in the dimension/attribute list
+        color_li = soup.find('li', class_='clearer')
+        while color_li:
+            title = color_li.find('div', class_='title')
+            if title and 'Color' in title.get_text():
+                desc = color_li.find('div', class_='description')
+                if desc:
+                    color = desc.get_text(strip=True)
+                    break
+            color_li = color_li.find_next_sibling('li', class_='clearer')
+    info['group_attr_2'] = color
+
+    # --- status (availability) ---
+    status = ''
+    avail_link = soup.find('link', {'itemprop': 'availability'})
+    if avail_link:
+        href = avail_link.get('href', '')
+        if 'InStock' in href:
+            status = 'In Stock'
+        elif 'OutOfStock' in href:
+            status = 'Out of Stock'
+    if not status:
+        # Fallback from product details
+        status_li = soup.find('li', class_='clearer')
+        while status_li:
+            title = status_li.find('div', class_='title')
+            if title and 'Availability' in title.get_text():
+                desc = status_li.find('div', class_='description')
+                if desc:
+                    status = desc.get_text(strip=True)
+                    break
+            status_li = status_li.find_next_sibling('li', class_='clearer')
+    info['status'] = status
+
+    # --- additional_data: JSON with extra info (collection, dimensions, features) ---
+    additional = {}
+
+    # Collection
+    collection = ''
+    coll_link = soup.find('a', href=lambda h: h and '/collection/' in h)
+    if coll_link:
+        collection = coll_link.get_text(strip=True)
+    else:
+        coll_li = soup.find('li', class_='clearer')
+        while coll_li:
+            title = coll_li.find('div', class_='title')
+            if title and 'Collection' in title.get_text():
+                desc = coll_li.find('div', class_='description')
+                if desc:
+                    collection = desc.get_text(strip=True)
+                    break
+            coll_li = coll_li.find_next_sibling('li', class_='clearer')
+    additional['collection'] = collection
+
+    # Dimensions (extract from the dimensions tab)
+    dims = {}
+    dims_section = soup.find('div', class_='product-dimensions')
+    if dims_section:
+        for row in dims_section.find_all('li', class_='clearer'):
+            title_div = row.find('div', class_='title')
+            dims_div = row.find('div', class_='dimensions')
+            if title_div and dims_div:
+                piece = title_div.get_text(strip=True)
+                dims[piece] = dims_div.get_text(strip=True)
+    additional['dimensions'] = dims
+
+    # Features (from the Details tab)
+    features = []
+    details_section = soup.find('div', class_='product-details')
+    if details_section:
+        for li in details_section.find_all('li', class_='clearer'):
+            title_div = li.find('div', class_='title')
+            if title_div and 'Features' in title_div.get_text():
+                desc_div = li.find('div', class_='description')
+                if desc_div:
+                    raw = desc_div.get_text(separator='\n').strip()
+                    features = [f.strip() for f in raw.split('\n') if f.strip()]
+                    break
+    additional['features'] = features
+
+    info['additional_data'] = json.dumps(additional, ensure_ascii=False)
+
+    return info
+
+
 
 def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl_delay=None):
+
     if product_url in seen:
         return
     seen.add(product_url)
-    
-    log(f"Processing product URL: {product_url}", "DEBUG")
-    
-    data = fetch_json(product_url, crawl_delay)
 
-    if not data:
+    log(f"Processing product URL: {product_url}", "DEBUG")
+
+    # Fetch HTML (http_get is assumed to be defined elsewhere)
+    html = http_get(product_url, crawl_delay)  # uses crawl_delay if provided
+
+    try:
+        product_info = extract_product_info_from_html(html, product_url)
+    except Exception as e:
+        log(f"Failed to extract product info from {product_url}: {e}", "ERROR")
         stats['errors'] += 1
-        log(f"No data found for product {product_url}", "ERROR")
         return
-    
-    product_info = extract_product_data(data)
-    if not product_info.get('product_id'):
-        stats['errors'] += 1
-        log(f"Invalid data for product {product_info.get('product_id', 'unknown')}", "ERROR")
-        return
-    
+
     try:
         row = [
             product_url,
-            product_info['product_id'],
-            product_info['variation_id'],
-            product_info['category'],
-            product_info['category_url'],
-            product_info['brand'],
-            product_info['name'],
-            product_info['sku'],
-            product_info['mpn'],
-            '',
-            product_info['price'],
-            normalize_image_url(product_info['main_image']),
-            product_info['quantity'],
-            product_info['group_attr_1'],
-            product_info['group_attr_2'],
-            product_info['status'],
-            product_info['additional_data'],
+            product_info.get('product_id',''),
+            product_info.get('variation_id',''),
+            product_info.get('category',''),
+            product_info.get('category_url',''),
+            product_info.get('brand',''),
+            product_info.get('name',''),
+            product_info.get('sku',''),
+            product_info.get('mpn',''),
+            '',                                 # empty column
+            product_info.get('price',''),
+            normalize_image_url(product_info.get('main_image','')),
+            product_info.get('quantity',''),
+            product_info.get('group_attr_1',''),
+            product_info.get('group_attr_2',''),
+            product_info.get('status',''),
+            product_info.get('additional_data',''),
             SCRAPED_DATE
         ]
-        
+
         with csv_lock:
             writer.writerow(row)
-        
+
         stats['products_fetched'] += 1
-        log(f"Fetched product {product_info['product_id']}: {product_info['name'][:50]}...", "INFO")
-        
+        log(f"Fetched product {product_info.get('sku', '')}: {product_info.get('name', '')[:50]}...", "INFO")
+
     except Exception as e:
         log(f"Error creating row for product {product_info.get('product_id', 'unknown')}: {e}", "ERROR")
         stats['errors'] += 1
-    
+
     time.sleep(REQUEST_DELAY_BASE)
     stats['urls_processed'] += 1
 
