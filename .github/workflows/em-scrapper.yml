@@ -1,4 +1,4 @@
-name: Emma Mason Scraper
+name: Emma Mason Scraper with FlareSolverr
 
 on:
   workflow_dispatch:
@@ -22,9 +22,42 @@ on:
       request_delay:
         description: "Delay between requests (seconds)"
         default: "1.0"
+      flaresolverr_url:
+        description: "FlareSolverr service URL"
+        default: "http://localhost:8191/v1"
 
 jobs:
+  setup-flaresolverr:
+    runs-on: ubuntu-latest
+    outputs:
+      service_url: ${{ steps.setup.outputs.service_url }}
+    steps:
+      - name: Start FlareSolverr service
+        id: setup
+        run: |
+          # Start FlareSolverr in Docker
+          docker run -d \
+            --name flaresolverr \
+            -p 8191:8191 \
+            -e LOG_LEVEL=info \
+            --restart unless-stopped \
+            ghcr.io/flaresolverr/flaresolverr:latest
+          
+          # Wait for FlareSolverr to be ready
+          echo "Waiting for FlareSolverr to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8191/v1 > /dev/null; then
+              echo "FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+          done
+          
+          echo "service_url=http://localhost:8191/v1" >> $GITHUB_OUTPUT
+
   plan:
+    needs: setup-flaresolverr
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -34,7 +67,6 @@ jobs:
         id: get_site_name
         run: |
           URL="${{ github.event.inputs.url }}"
-          # Extract site name from URL (remove protocol, www, and domain extension)
           SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
           echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
           echo "Site name extracted: $SITE_NAME"
@@ -44,22 +76,18 @@ jobs:
           TOTAL=${{ github.event.inputs.total_sitemaps }}
           PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
           URL="${{ github.event.inputs.url }}"
-          SITEMAP_INDEX="${{ github.event.inputs.sitemap_index }}"
           
-          # If total is 0, use a default value
           if [ "$TOTAL" -eq 0 ]; then
             echo "Using default total sitemaps: 10"
             TOTAL=10
           fi
           
-          # Calculate number of jobs
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
           
-          # Build matrix JSON
           MATRIX="["
           for ((i=0;i<JOBS;i++)); do
             OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\",\"sitemap_index\":\"$SITEMAP_INDEX\"},"
+            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
           done
           MATRIX="${MATRIX%,}]"
           
@@ -69,10 +97,10 @@ jobs:
           echo "Jobs planned: $JOBS"
 
   scrape:
-    needs: plan
+    needs: [plan, setup-flaresolverr]
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false  # This prevents one failure from canceling other jobs
+      fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     
@@ -87,34 +115,32 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 cloudscraper curl-cffi lxml
+          pip install requests beautifulsoup4 lxml
 
-      - name: Run Emma Mason scraper
+      - name: Run Emma Mason scraper with FlareSolverr
         id: scrape_run
-        continue-on-error: true  # Continue even if this step fails
+        continue-on-error: true
         env:
           CURR_URL: ${{ matrix.url }}
-          SITEMAP_INDEX: ${{ matrix.sitemap_index }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          FLARESOLVERR_URL: ${{ needs.setup-flaresolverr.outputs.service_url }}
         run: |
-          echo "Starting Emma Mason scraper with configuration:"
+          echo "Starting Emma Mason scraper with FlareSolverr:"
           echo "CURR_URL: $CURR_URL"
-          echo "SITEMAP_INDEX: $SITEMAP_INDEX"
           echo "SITEMAP_OFFSET: $SITEMAP_OFFSET"
           echo "MAX_SITEMAPS: $MAX_SITEMAPS"
           echo "MAX_URLS_PER_SITEMAP: $MAX_URLS_PER_SITEMAP"
           echo "MAX_WORKERS: $MAX_WORKERS"
           echo "REQUEST_DELAY: $REQUEST_DELAY"
+          echo "FLARESOLVERR_URL: $FLARESOLVERR_URL"
           echo ""
           
-          # Run the Emma Mason scraper
-          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
+          python em_scraper.py || echo "Scraper failed with exit code $?"
           
-          # List output files
           echo ""
           echo "Generated files:"
           ls -la *.csv 2>/dev/null || echo "No CSV files generated"
@@ -145,22 +171,16 @@ jobs:
       - name: Check for CSV files
         id: check_files
         run: |
-          # Find all CSV files
           CSV_FILES=$(find chunks -name "products_chunk_*.csv" 2>/dev/null || echo "")
           
           if [ -z "$CSV_FILES" ]; then
             echo "has_files=false" >> $GITHUB_OUTPUT
             echo "ERROR: No CSV files found in artifacts!"
-            echo "Checking chunks directory structure:"
-            find chunks -type f -ls 2>/dev/null || echo "chunks directory not found or empty"
-            echo "Listing artifacts directory:"
-            ls -la chunks/ 2>/dev/null || echo "chunks directory not found"
-            exit 0  # Don't fail, just flag that no files found
+            exit 0
           else
             echo "has_files=true" >> $GITHUB_OUTPUT
             echo "Found CSV files:"
             echo "$CSV_FILES"
-            # Count successful chunks
             CHUNK_COUNT=$(echo "$CSV_FILES" | wc -l)
             echo "chunk_count=$CHUNK_COUNT" >> $GITHUB_OUTPUT
           fi
@@ -171,17 +191,13 @@ jobs:
         run: |
           echo "Merging CSV chunks..."
           
-          # Find all CSV files
           CSV_FILES=$(find chunks -name "products_chunk_*.csv")
           
-          # Get the first file for header
           FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
           echo "Using header from: $FIRST_FILE"
           
-          # Copy header
           head -n 1 "$FIRST_FILE" > products_full.csv
           
-          # Count and merge rows
           TOTAL_ROWS=0
           FILE_COUNT=0
           for f in $CSV_FILES; do
@@ -196,8 +212,6 @@ jobs:
           
           FINAL_ROWS=$(tail -n +2 products_full.csv 2>/dev/null | wc -l || echo "0")
           echo "Merged $FINAL_ROWS rows from $FILE_COUNT files"
-          
-          # Store counts for summary
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
           echo "final_rows=$FINAL_ROWS" >> $GITHUB_OUTPUT
 
@@ -270,9 +284,9 @@ jobs:
           echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
           echo "  Sitemaps/Job:  ${{ github.event.inputs.sitemaps_per_job }}"
           echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
+          echo "  FlareSolverr:  Enabled"
           echo "========================================="
           
-          # Show sample of data if available
           if [ -f "products_full.csv" ]; then
             echo ""
             echo "First 3 rows of data:"
