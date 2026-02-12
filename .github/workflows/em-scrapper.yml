@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload chunk (even on failure)
         uses: actions/upload-artifact@v4
-        if: always()  # Always upload, even if previous step failed
+        if: always()
         with:
           name: chunk_${{ matrix.offset }}
           path: |
@@ -129,13 +129,14 @@ jobs:
           if-no-files-found: warn
 
   merge:
-    needs: [plan]  # Only need plan, not scrape
+    needs: [plan, scrape]
     runs-on: ubuntu-latest
-    if: always()  # Always run, regardless of scrape job status
+    if: always() && !cancelled()
     
     steps:
       - name: Download all chunks
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           path: chunks
           pattern: chunk_*
