@@ -157,10 +157,10 @@ def check_robots_txt():
 def fetch_xml(url):
     """Try normal GET first, fallback to FlareSolverr if needed."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if r.status_code == 200:
-            return r.text
-        elif r.status_code in (403, 503) and FLARESOLVERR_URL:
+        content, status = flaresolverr_session.fetch(url)
+        if status == 200:
+            return content
+        elif status in (403, 503) and FLARESOLVERR_URL:
             # Fallback to FlareSolverr
             payload = {
                 "cmd": "request.get",
