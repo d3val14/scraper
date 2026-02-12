@@ -62,6 +62,7 @@ class FurniturepickSpider(SitemapSpider):
     
     def parse_robots(self, response):
         """Parse robots.txt to find sitemap URLs"""
+        print(response.status)
         if response.status == 200:
             # Extract sitemap URLs from robots.txt
             for line in response.text.split('\n'):
