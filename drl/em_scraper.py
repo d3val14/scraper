@@ -25,9 +25,10 @@ SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
-REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "1.0"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "0"))
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "5"))
+GLOBAL_RATE_LIMIT = os.getenv("GLOBAL_RATE_LIMIT", "false").strip().lower() in ("1", "true", "yes")
 
 # FlareSolverr configuration
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
@@ -76,9 +77,30 @@ def get_flaresolverr_session():
         }
     return _thread_local.session, _thread_local.headers
 
+def get_flaresolverr_browser_session_id(session: requests.Session) -> Optional[str]:
+    """Create and cache one FlareSolverr browser session per worker thread."""
+    if hasattr(_thread_local, "flaresolverr_session_id"):
+        return _thread_local.flaresolverr_session_id
+
+    session_id = f"em-{threading.get_ident()}-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+    try:
+        resp = session.post(
+            FLARESOLVERR_URL,
+            json={"cmd": "sessions.create", "session": session_id},
+            timeout=30
+        )
+        if resp.status_code == 200 and resp.json().get("status") == "ok":
+            _thread_local.flaresolverr_session_id = session_id
+            return session_id
+        log(f"Failed creating FlareSolverr session for thread {threading.get_ident()}: {resp.text}", "WARNING")
+    except Exception as e:
+        log(f"Failed creating FlareSolverr session for thread {threading.get_ident()}: {e}", "WARNING")
+    return None
+
 def flaresolverr_request(url: str, max_retries: int = 3) -> Optional[Tuple[str, int]]:
     """Make request through FlareSolverr using thread-local session."""
     session, headers = get_flaresolverr_session()
+    flaresolverr_session_id = get_flaresolverr_browser_session_id(session)
     
     for attempt in range(max_retries):
         try:
@@ -86,9 +108,10 @@ def flaresolverr_request(url: str, max_retries: int = 3) -> Optional[Tuple[str, 
                 "cmd": "request.get",
                 "url": url,
                 "maxTimeout": 120000,          # 2 minutes
-                "session": None,                # new session each time (or you can reuse)
                 "headers": headers
             }
+            if flaresolverr_session_id:
+                payload["session"] = flaresolverr_session_id
             
             response = session.post(
                 FLARESOLVERR_URL,
@@ -118,6 +141,11 @@ def flaresolverr_request(url: str, max_retries: int = 3) -> Optional[Tuple[str, 
                                 headers[key] = value
                     
                     return content, 200
+                message = result.get("message", "")
+                if "session" in message.lower() and "exist" in message.lower():
+                    if hasattr(_thread_local, "flaresolverr_session_id"):
+                        delattr(_thread_local, "flaresolverr_session_id")
+                    flaresolverr_session_id = get_flaresolverr_browser_session_id(session)
             
             log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}")
             
@@ -141,29 +169,40 @@ class RequestManager:
         self.request_count = 0
         self.last_request_time = 0
         self.retry_delays = [1, 2, 4]
-        self._lock = threading.Lock()   # for rate limiting across threads
+        self._lock = threading.Lock()
+        self._thread_local = threading.local()
         
     def _respect_rate_limit(self, crawl_delay=None):
-        with self._lock:
-            current_time = time.time()
-            if self.request_count > 0:
-                elapsed = current_time - self.last_request_time
-                base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
-                min_delay = base_delay * 0.8
-                max_delay = base_delay * 1.5
-                target_delay = random.uniform(min_delay, max_delay)
-                
-                if elapsed < target_delay:
-                    sleep_time = target_delay - elapsed
-                    time.sleep(sleep_time)
-            
-            self.last_request_time = time.time()
-            self.request_count += 1
-            
-            if self.request_count % 20 == 0:
-                long_pause = random.uniform(2, 5)
-                log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
-                time.sleep(long_pause)
+        base_delay = crawl_delay if crawl_delay is not None else REQUEST_DELAY_BASE
+        if base_delay <= 0:
+            return
+
+        if GLOBAL_RATE_LIMIT:
+            with self._lock:
+                current_time = time.time()
+                if self.request_count > 0:
+                    elapsed = current_time - self.last_request_time
+                    min_delay = base_delay * 0.8
+                    max_delay = base_delay * 1.5
+                    target_delay = random.uniform(min_delay, max_delay)
+
+                    if elapsed < target_delay:
+                        time.sleep(target_delay - elapsed)
+
+                self.last_request_time = time.time()
+                self.request_count += 1
+                return
+
+        if not hasattr(self._thread_local, "last_request_time"):
+            self._thread_local.last_request_time = 0.0
+
+        elapsed = time.time() - self._thread_local.last_request_time
+        min_delay = base_delay * 0.8
+        max_delay = base_delay * 1.5
+        target_delay = random.uniform(min_delay, max_delay)
+        if elapsed < target_delay:
+            time.sleep(target_delay - elapsed)
+        self._thread_local.last_request_time = time.time()
     
     def fetch(self, url: str, retry_count: int = 0, crawl_delay=None) -> Optional[str]:
         if retry_count >= len(self.retry_delays):
@@ -478,19 +517,30 @@ def extract_product_data(product_data: dict) -> dict:
         print(f"Error extracting product data: {e}")
         return {}
 
-def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl_delay=None):
-    if product_url in seen:
-        return
-    seen.add(product_url)
+def process_product_data(
+    product_url: str,
+    writer,
+    seen: set,
+    seen_lock: threading.Lock,
+    stats: dict,
+    stats_lock: threading.Lock,
+    crawl_delay=None
+):
+    with seen_lock:
+        if product_url in seen:
+            return
+        seen.add(product_url)
     log(f"Processing product URL: {product_url}", "DEBUG")
     data = fetch_json(product_url, crawl_delay)
     if not data:
-        stats['errors'] += 1
+        with stats_lock:
+            stats['errors'] += 1
         log(f"No data found for product {product_url}", "ERROR")
         return
     product_info = extract_product_data(data)
     if not product_info.get('product_id'):
-        stats['errors'] += 1
+        with stats_lock:
+            stats['errors'] += 1
         log(f"Invalid data for product {product_info.get('product_id', 'unknown')}", "ERROR")
         return
     try:
@@ -516,13 +566,15 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl
         ]
         with csv_lock:
             writer.writerow(row)
-        stats['products_fetched'] += 1
+        with stats_lock:
+            stats['products_fetched'] += 1
         log(f"Fetched product {product_info['product_id']}: {product_info['name'][:50]}...", "INFO")
     except Exception as e:
         log(f"Error creating row for product {product_info.get('product_id', 'unknown')}: {e}", "ERROR")
-        stats['errors'] += 1
-    time.sleep(REQUEST_DELAY_BASE)
-    stats['urls_processed'] += 1
+        with stats_lock:
+            stats['errors'] += 1
+    with stats_lock:
+        stats['urls_processed'] += 1
 
 # ================= MAIN =================
 
@@ -613,6 +665,8 @@ def main():
         ])
         
         seen = set()
+        seen_lock = threading.Lock()
+        stats_lock = threading.Lock()
         stats = {
             'sitemaps_processed': 0,
             'urls_processed': 0,
@@ -656,7 +710,16 @@ def main():
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = [
-                    executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
+                    executor.submit(
+                        process_product_data,
+                        url,
+                        writer,
+                        seen,
+                        seen_lock,
+                        stats,
+                        stats_lock,
+                        crawl_delay
+                    )
                     for url in urls
                 ]
                 for future in as_completed(futures):

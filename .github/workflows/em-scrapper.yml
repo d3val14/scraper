@@ -18,10 +18,13 @@ on:
         default: "100"
       max_workers:
         description: "Parallel requests per job"
-        default: "4"
+        default: "10"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "1.0"
+        default: "0"
+      global_rate_limit:
+        description: "Force global delay across threads (true/false)"
+        default: "false"
       sample_size:
         description: "Number of URLs to sample for product checking"
         default: "5"
@@ -134,6 +137,7 @@ jobs:
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          GLOBAL_RATE_LIMIT: ${{ github.event.inputs.global_rate_limit }}
           SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
           FLARESOLVERR_URL: http://localhost:8191/v1
         run: |
@@ -144,6 +148,7 @@ jobs:
           echo "MAX_URLS_PER_SITEMAP: $MAX_URLS_PER_SITEMAP"
           echo "MAX_WORKERS: $MAX_WORKERS"
           echo "REQUEST_DELAY: $REQUEST_DELAY"
+          echo "GLOBAL_RATE_LIMIT: $GLOBAL_RATE_LIMIT"
           echo "SAMPLE_SIZE: $SAMPLE_SIZE"
           echo "FLARESOLVERR_URL: $FLARESOLVERR_URL"
           echo ""
@@ -295,6 +300,7 @@ jobs:
           echo "Configuration:"
           echo "  Max Workers:   ${{ github.event.inputs.max_workers }}"
           echo "  Request Delay: ${{ github.event.inputs.request_delay }}s"
+          echo "  Global Rate Limit: ${{ github.event.inputs.global_rate_limit }}"
           echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
           echo "  Sitemaps/Job:  ${{ github.event.inputs.sitemaps_per_job }}"
           echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
