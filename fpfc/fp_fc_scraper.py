@@ -518,7 +518,7 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl
         if not bundle_set:
             log("No <div class='bundle-set'> found – cannot process variations. Writing original row as fallback.", "WARNING")
         else:
-            selection_items = bundle_set.find_all('li', class_=lambda c: c and 'selection-item-' in ' '.join(c) if c else False)
+            selection_items = bundle_set.select("ul > li[class*='selection-item-']")
             if not selection_items:
                 log("No selection items found in bundle-set – cannot process variations. Writing original row as fallback.", "WARNING")
             else:
