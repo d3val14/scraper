@@ -1,4 +1,4 @@
-name: Emma Mason Scraper with FlareSolverr
+name: FP FC Scraper with FlareSolverr (Chunked)
 
 on:
   workflow_dispatch:
@@ -6,39 +6,41 @@ on:
       url:
         description: "Base site URL"
         required: true
-        default: "https://www.emmamason.com"
+        default: "https://www.furniturecart.com"
       total_sitemaps:
         description: "Total sitemaps to process (0 = auto)"
         default: "0"
-      sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        default: "2"
       urls_per_sitemap:
-        description: "Max URLs per sitemap"
-        default: "100"
+        description: "Max URLs to take from one sitemap (0 = all)"
+        default: "1000"
+      urls_per_job:
+        description: "Max URLs to process per job (splits large sitemaps)"
+        default: "500"
       max_workers:
         description: "Parallel requests per job"
-        default: "10"
-      flaresolverr_instances:
-        description: "FlareSolverr instances per job (0 = same as max_workers)"
-        default: "0"
+        default: "4"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "0"
-      global_rate_limit:
-        description: "Force global delay across threads (true/false)"
-        default: "false"
+        default: "1.0"
       sample_size:
-        description: "Number of URLs to sample for product checking"
+        description: "URLs to sample for product detection"
         default: "5"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      matrix: ${{ steps.generate_matrix.outputs.matrix }}
       site_name: ${{ steps.get_site_name.outputs.site_name }}
     steps:
+      - uses: actions/checkout@v4   # Needed to access generate_chunks.py
+
       - name: Get site name from URL
         id: get_site_name
         run: |
@@ -46,31 +48,50 @@ jobs:
           SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
           echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
           echo "Site name extracted: $SITE_NAME"
-      
-      - id: matrix
+
+      - name: Wait for FlareSolverr to be ready
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
-          
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Using default total sitemaps: 10"
-            TOTAL=10
-          fi
-          
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
-          
-          MATRIX="["
-          for ((i=0;i<JOBS;i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
           done
-          MATRIX="${MATRIX%,}]"
-          
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total sitemaps: $TOTAL"
-          echo "Sitemaps per job: $PER_JOB"
-          echo "Jobs planned: $JOBS"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Generate chunk matrix
+        id: generate_matrix
+        env:
+          CURR_URL: ${{ github.event.inputs.url }}
+          MAX_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
+          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
+          URLS_PER_JOB: ${{ github.event.inputs.urls_per_job }}
+          SITEMAP_OFFSET: 0
+          FLARESOLVERR_URL: http://localhost:8191/v1
+        run: python fpfc/generate_chunks.py   # <-- external script
+
+      - name: Debug matrix output
+        run: |
+          echo "Generated matrix:"
+          echo '${{ steps.generate_matrix.outputs.matrix }}' | jq . || echo "Not valid JSON"
 
   scrape:
     needs: plan
@@ -79,68 +100,27 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
-    
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start FlareSolverr pool
-        id: flaresolverr_pool
+      - name: Wait for FlareSolverr
         run: |
-          INSTANCES="${{ github.event.inputs.flaresolverr_instances }}"
-          MAX_WORKERS="${{ github.event.inputs.max_workers }}"
-          if [ -z "$INSTANCES" ] || [ "$INSTANCES" = "0" ]; then
-            INSTANCES="$MAX_WORKERS"
-          fi
-          if [ "$INSTANCES" -lt 1 ]; then
-            INSTANCES=1
-          fi
-
-          BASE_PORT=8191
-          URLS=""
-
-          echo "Starting $INSTANCES FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            echo "Starting $NAME on localhost:$PORT"
-            docker run -d --name "$NAME" --cap-add=SYS_ADMIN -p "${PORT}:8191" ghcr.io/flaresolverr/flaresolverr:latest >/dev/null
-          done
-
-          echo "Waiting for all FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            URL="http://localhost:${PORT}/v1"
-
-            READY=0
-            for attempt in {1..45}; do
-              if curl -s -f -X POST "$URL" \
-                -H "Content-Type: application/json" \
-                -d '{"cmd":"sessions.list"}' > /dev/null 2>&1; then
-                READY=1
-                echo "✓ $NAME ready"
-                break
-              fi
-              sleep 2
-            done
-
-            if [ "$READY" -ne 1 ]; then
-              echo "❌ $NAME failed to start"
-              docker logs "$NAME" || true
-              exit 1
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr ready"
+              break
             fi
-
-            if [ -z "$URLS" ]; then
-              URLS="$URL"
-            else
-              URLS="$URLS,$URL"
-            fi
+            sleep 2
           done
-
-          echo "instances=$INSTANCES" >> $GITHUB_OUTPUT
-          echo "urls=$URLS" >> $GITHUB_OUTPUT
-          echo "first_url=http://localhost:8191/v1" >> $GITHUB_OUTPUT
-          echo "FlareSolverr URL list: $URLS"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -148,87 +128,39 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4 lxml
 
-      - name: Create scraper file
-        run: |
-          cat > em_scraper.py << 'EOF'
-          # PASTE THE COMPLETE UPDATED SCRAPER CODE FROM BELOW
-          EOF
-
-      - name: Run Emma Mason scraper with FlareSolverr
+      - name: Run scraper chunk
         id: scrape_run
         continue-on-error: true
         env:
-          CURR_URL: ${{ matrix.url }}
-          SITEMAP_OFFSET: ${{ matrix.offset }}
-          MAX_SITEMAPS: ${{ matrix.limit }}
-          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
+          SITEMAP_URL: ${{ matrix.sitemap_url }}
+          URL_OFFSET: ${{ matrix.offset }}
+          MAX_URLS_PER_SITEMAP: ${{ matrix.limit }}
+          CHUNK_ID: ${{ matrix.chunk_id }}
+          CURR_URL: ${{ matrix.base_url }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
-          FLARESOLVERR_INSTANCES: ${{ steps.flaresolverr_pool.outputs.instances }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
-          GLOBAL_RATE_LIMIT: ${{ github.event.inputs.global_rate_limit }}
           SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
-          FLARESOLVERR_URL: ${{ steps.flaresolverr_pool.outputs.first_url }}
-          FLARESOLVERR_URLS: ${{ steps.flaresolverr_pool.outputs.urls }}
+          FLARESOLVERR_URL: http://localhost:8191/v1
         run: |
-          echo "Starting Emma Mason scraper with FlareSolverr:"
-          echo "CURR_URL: $CURR_URL"
-          echo "SITEMAP_OFFSET: $SITEMAP_OFFSET"
-          echo "MAX_SITEMAPS: $MAX_SITEMAPS"
-          echo "MAX_URLS_PER_SITEMAP: $MAX_URLS_PER_SITEMAP"
-          echo "MAX_WORKERS: $MAX_WORKERS"
-          echo "FLARESOLVERR_INSTANCES: $FLARESOLVERR_INSTANCES"
-          echo "REQUEST_DELAY: $REQUEST_DELAY"
-          echo "GLOBAL_RATE_LIMIT: $GLOBAL_RATE_LIMIT"
-          echo "SAMPLE_SIZE: $SAMPLE_SIZE"
-          echo "FLARESOLVERR_URL: $FLARESOLVERR_URL"
-          echo "FLARESOLVERR_URLS: $FLARESOLVERR_URLS"
-          echo ""
-          
-          python -c "
-          import requests
-          import sys
-          import os
-          first = os.environ.get('FLARESOLVERR_URL')
-          try:
-              r = requests.post(first, 
-                              json={'cmd': 'sessions.list'}, 
-                              timeout=10)
-              print(f'✓ FlareSolverr connection test: {r.status_code}')
-              sys.exit(0)
-          except Exception as e:
-              print(f'✗ FlareSolverr connection failed: {e}')
-              sys.exit(1)
-          "
-          
-          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
-          
-          echo ""
-          echo "Generated files:"
-          ls -la *.csv 2>/dev/null || echo "No CSV files generated"
+          echo "Processing chunk $CHUNK_ID"
+          echo "Sitemap: $SITEMAP_URL"
+          echo "Offset: $URL_OFFSET, Limit: $MAX_URLS_PER_SITEMAP"
+          python fpfc/fp_fc_scraper.py || echo "Scraper failed with exit code $?"
 
-      - name: Stop FlareSolverr pool
-        if: always()
-        run: |
-          docker ps -a --format '{{.Names}}' | grep '^flaresolverr_' | xargs -r docker rm -f
-
-      - name: Upload chunk (even on failure)
+      - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: chunk_${{ matrix.offset }}
-          path: |
-            products_chunk_*.csv
+          name: chunk_${{ matrix.chunk_id }}
+          path: products_chunk_*.csv
           if-no-files-found: warn
 
   merge:
     needs: [plan, scrape]
     runs-on: ubuntu-latest
     if: always() && !cancelled()
-    
     steps:
       - name: Download all chunks
         uses: actions/download-artifact@v4
@@ -284,7 +216,7 @@ jobs:
         run: |
           SITE_NAME="${{ needs.plan.outputs.site_name }}"
           if [ -z "$SITE_NAME" ]; then
-            SITE_NAME="emma_mason"
+            SITE_NAME="fp_fc"
           fi
           DATE=$(date +%F_%H%M%S)
           echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
@@ -322,10 +254,6 @@ jobs:
           TOTAL_ROWS="${{ steps.merge_csv.outputs.final_rows || '0' }}"
           SUCCESSFUL_CHUNKS="${{ steps.check_files.outputs.chunk_count || '0' }}"
           PLANNED_JOBS="${{ fromJson(needs.plan.outputs.matrix).length || '0' }}"
-          FS_INSTANCES="${{ github.event.inputs.flaresolverr_instances }}"
-          if [ -z "$FS_INSTANCES" ] || [ "$FS_INSTANCES" = "0" ]; then
-            FS_INSTANCES="${{ github.event.inputs.max_workers }} (auto)"
-          fi
           
           echo "========================================="
           echo "          SCRAPING SUMMARY"
@@ -345,14 +273,12 @@ jobs:
           echo ""
           echo "Configuration:"
           echo "  Max Workers:   ${{ github.event.inputs.max_workers }}"
-          echo "  FlareSolverr Instances: $FS_INSTANCES"
           echo "  Request Delay: ${{ github.event.inputs.request_delay }}s"
-          echo "  Global Rate Limit: ${{ github.event.inputs.global_rate_limit }}"
           echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
-          echo "  Sitemaps/Job:  ${{ github.event.inputs.sitemaps_per_job }}"
+          echo "  URLs/Job:      ${{ github.event.inputs.urls_per_job }}"
           echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
           echo "  Sample Size:   ${{ github.event.inputs.sample_size }}"
-          echo "  FlareSolverr:  Enabled (Dynamic Instance Pool)"
+          echo "  FlareSolverr:  Enabled"
           echo "========================================="
           
           if [ -f "products_full.csv" ]; then
@@ -365,12 +291,10 @@ jobs:
             echo "No data was successfully scraped!"
           fi
 
-      - name: Archive results (if any)
+      - name: Archive final results
         if: steps.merge_csv.outputs.final_rows > 0
         uses: actions/upload-artifact@v4
         with:
           name: final_results
-          path: |
-            products_full.json
-            products_full.csv
+          path: products_full.csv
           retention-days: 7
