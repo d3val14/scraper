@@ -28,10 +28,11 @@ MAX_URLS_PER_SITEMAP = int(os.environ.get("MAX_URLS_PER_SITEMAP", "0"))
 URLS_PER_JOB = int(os.environ.get("URLS_PER_JOB", "500"))
 SITEMAP_OFFSET = int(os.environ.get("SITEMAP_OFFSET", "0"))
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL")
+CHUNK_GEN_WORKERS = int(os.environ.get("CHUNK_GEN_WORKERS", "2"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SitemapParser/1.0)"}
 
-FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "60"))
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
 class FlareSolverrSession:
     def __init__(self):
@@ -58,7 +59,7 @@ class FlareSolverrSession:
                 payload = {
                     "cmd": "request.get",
                     "url": url,
-                    "maxTimeout": 60000,
+                    "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
                     "session": None,  # Create new session
                     "headers": self.headers
                 }
@@ -216,6 +217,7 @@ end = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemap_locs)
 sitemap_locs = sitemap_locs[SITEMAP_OFFSET:end]
 
 print(f"Total sitemaps to analyze: {len(sitemap_locs)}")
+print(f"Chunk generator workers: {CHUNK_GEN_WORKERS}")
 
 # ---------- 2. For each sitemap, count product URLs ----------
 sitemap_stats = []
@@ -239,7 +241,8 @@ def process_sitemap(sm_url):
         total = MAX_URLS_PER_SITEMAP
     return {"url": sm_url, "total_urls": total}
 
-with ThreadPoolExecutor(max_workers=5) as executor:
+worker_count = max(1, min(CHUNK_GEN_WORKERS, len(sitemap_locs)))
+with ThreadPoolExecutor(max_workers=worker_count) as executor:
     futures = [executor.submit(process_sitemap, url) for url in sitemap_locs]
     for future in as_completed(futures):
         sitemap_stats.append(future.result())

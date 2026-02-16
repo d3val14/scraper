@@ -85,6 +85,8 @@ jobs:
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           URLS_PER_JOB: ${{ github.event.inputs.urls_per_job }}
           SITEMAP_OFFSET: 0
+          CHUNK_GEN_WORKERS: 1
+          FLARESOLVERR_TIMEOUT: 180
           FLARESOLVERR_URL: http://localhost:8191/v1
         run: python fpfc/generate_chunks.py
 
