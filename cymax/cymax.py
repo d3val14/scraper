@@ -731,7 +731,7 @@ def main():
                 "Ref Category URL",
                 "Ref Brand Name",
                 "Ref Product Name",
-                "Set Includes Name",
+                # "Set Includes Name",
                 "Ref SKU",
                 "Ref MPN",
                 "Ref GTIN",
@@ -741,7 +741,7 @@ def main():
                 "Ref Group Attr 1",
                 "Ref Group Attr 2",
                 "Ref Status",
-                "Additional Product Data",
+                # "Additional Product Data",
                 "Date Scrapped"
             ])
 
@@ -842,7 +842,7 @@ def main():
                 "Ref Category URL",
                 "Ref Brand Name",
                 "Ref Product Name",
-                "Set Includes Name",
+                # "Set Includes Name",
                 "Ref SKU",
                 "Ref MPN",
                 "Ref GTIN",
@@ -852,7 +852,7 @@ def main():
                 "Ref Group Attr 1",
                 "Ref Group Attr 2",
                 "Ref Status",
-                "Additional Product Data",
+                # "Additional Product Data",
                 "Date Scrapped"
             ])
 
@@ -961,7 +961,7 @@ def main():
             "Ref Category URL",
             "Ref Brand Name",
             "Ref Product Name",
-            "Set Includes Name",
+            # "Set Includes Name",
             "Ref SKU",
             "Ref MPN",
             "Ref GTIN",
@@ -971,7 +971,7 @@ def main():
             "Ref Group Attr 1",
             "Ref Group Attr 2",
             "Ref Status",
-            "Additional Product Data",
+            # "Additional Product Data",
             "Date Scrapped"
         ])
 
