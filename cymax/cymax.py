@@ -3,113 +3,63 @@ import csv
 import time
 import sys
 import gc
-import random
 import threading
 import requests
-from typing import Optional, Tuple
+import random
+import re
+import json
+import html
+import ast
+from typing import Optional, List, Dict, Tuple
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-import re
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "https://www.cymax.com").rstrip("/")
+SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
-MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "500"))  # Limit per sitemap
-MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "1000"))
-PRODUCT_URLS_FILE = os.getenv("PRODUCT_URLS_FILE", "").strip()
-URL_OFFSET = int(os.getenv("URL_OFFSET", "0"))
-URL_LIMIT = int(os.getenv("URL_LIMIT", "0"))
-CHUNK_ID = os.getenv("CHUNK_ID", str(SITEMAP_OFFSET))
-
-# Workers and delays
+MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
-REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "0"))
-FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
-FLARESOLVERR_URLS_RAW = os.getenv("FLARESOLVERR_URLS", "").strip()
-FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "60"))
-FLARESOLVERR_URLS = [
-    url.strip()
-    for url in FLARESOLVERR_URLS_RAW.split(",")
-    if url.strip()
-]
-if not FLARESOLVERR_URLS:
-    FLARESOLVERR_URLS = [FLARESOLVERR_URL]
+REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "1.0"))
+SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "5"))
 
-SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
-if PRODUCT_URLS_FILE:
+# FlareSolverr configuration
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "60"))
+
+# ---------- NEW: chunked single‑sitemap mode ----------
+SITEMAP_URL = os.getenv("SITEMAP_URL", "")          # process exactly this sitemap
+URL_OFFSET   = int(os.getenv("URL_OFFSET", "0"))    # start index inside the sitemap
+URL_LIMIT    = int(os.getenv("URL_LIMIT", "0"))     # max urls in chunk mode
+CHUNK_ID     = os.getenv("CHUNK_ID", str(SITEMAP_OFFSET))  # unique chunk identifier
+PRODUCT_URLS_FILE = os.getenv("PRODUCT_URLS_FILE", "").strip()
+
+# Output file name: use CHUNK_ID when in chunk/file mode, else fallback to offset
+if PRODUCT_URLS_FILE or SITEMAP_URL:
     OUTPUT_CSV = f"cymax_products_{CHUNK_ID}.csv"
 else:
     OUTPUT_CSV = f"cymax_products_{SITEMAP_OFFSET}.csv"
-SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ================= LOGGER =================
 
 def log(msg: str, level: str = "INFO"):
-    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}\n")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sys.stderr.write(f"[{timestamp}] [{level}] {msg}\n")
     sys.stderr.flush()
 
-def sanitize_url_text(text: str) -> str:
-    if not text:
-        return ""
-    # Remove HTML tags/noise and extract first URL token.
-    clean = re.sub(r"<[^>]+>", " ", text)
-    match = re.search(r"https?://[^\s\"'<>]+", clean)
-    return match.group(0).strip() if match else ""
+# ================= FLARESOLVERR SESSION =================
 
-def extract_xml_payload(raw: str) -> str:
-    if not raw:
-        return ""
-    text = raw.strip()
-    # Handle HTML wrappers around XML, e.g. <pre>...</pre>.
-    for root_tag in ("sitemapindex", "urlset"):
-        start_idx = text.find(f"<{root_tag}")
-        end_tag = f"</{root_tag}>"
-        end_idx = text.rfind(end_tag)
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            return text[start_idx:end_idx + len(end_tag)]
-    return text
-
-# ================= THREAD-LOCAL FLARESOLVERR =================
-
-_thread_local = threading.local()
-_endpoint_assign_lock = threading.Lock()
-_endpoint_assign_counter = 0
-
-def get_thread_flaresolverr_url() -> str:
-    global _endpoint_assign_counter
-    if hasattr(_thread_local, "flaresolverr_url"):
-        return _thread_local.flaresolverr_url
-
-    with _endpoint_assign_lock:
-        idx = _endpoint_assign_counter % len(FLARESOLVERR_URLS)
-        _endpoint_assign_counter += 1
-
-    _thread_local.flaresolverr_url = FLARESOLVERR_URLS[idx]
-    log(
-        f"Thread {threading.get_ident()} assigned FlareSolverr endpoint {_thread_local.flaresolverr_url}",
-        "DEBUG",
-    )
-    return _thread_local.flaresolverr_url
-
-def get_flaresolverr_session() -> Tuple[requests.Session, dict]:
-    if not hasattr(_thread_local, "session"):
-        session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=MAX_WORKERS * 2,
-            pool_maxsize=MAX_WORKERS * 2,
-            max_retries=Retry(total=2, backoff_factor=0.5),
-        )
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        _thread_local.session = session
-        _thread_local.headers = {
+class FlareSolverrSession:
+    def __init__(self):
+        self.session = requests.Session()
+        self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "en-US,en;q=0.9",
@@ -123,320 +73,412 @@ def get_flaresolverr_session() -> Tuple[requests.Session, dict]:
             "Cache-Control": "max-age=0",
             "Referer": CURR_URL + "/",
         }
-    return _thread_local.session, _thread_local.headers
 
-def get_flaresolverr_browser_session_id(session: requests.Session, flaresolverr_url: str) -> Optional[str]:
-    if hasattr(_thread_local, "flaresolverr_session_id"):
-        return _thread_local.flaresolverr_session_id
+    def flaresolverr_request(self, url: str, max_retries: int = 3) -> Optional[Tuple[str, int]]:
+        """Make request through FlareSolverr to bypass Cloudflare"""
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    "cmd": "request.get",
+                    "url": url,
+                    "maxTimeout": 60000,
+                    "session": None,  # Create new session
+                    "headers": self.headers
+                }
+                
+                response = self.session.post(
+                    FLARESOLVERR_URL,
+                    json=payload,
+                    timeout=FLARESOLVERR_TIMEOUT
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if result.get("status") == "ok":
+                        solution = result.get("solution", {})
+                        content = solution.get("response", "")
+                        
+                        # Extract cookies for potential future requests
+                        cookies = solution.get("cookies", [])
+                        for cookie in cookies:
+                            self.session.cookies.set(
+                                cookie.get("name"),
+                                cookie.get("value"),
+                                domain=cookie.get("domain")
+                            )
+                        
+                        # Update headers from response
+                        if "headers" in solution:
+                            for key, value in solution["headers"].items():
+                                if key.lower() not in ["content-length", "content-encoding", "transfer-encoding"]:
+                                    self.headers[key] = value
+                        
+                        return content, 200
+                
+                log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}")
+                
+            except requests.exceptions.Timeout:
+                log(f"FlareSolverr timeout on attempt {attempt + 1} for {url}")
+            except requests.exceptions.ConnectionError:
+                log(f"FlareSolverr connection error on attempt {attempt + 1} for {url}")
+            except Exception as e:
+                log(f"FlareSolverr error on attempt {attempt + 1} for {url}: {e}")
+            
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        return None, 0
 
-    session_id = f"cymax-{threading.get_ident()}-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+    def fetch(self, url: str) -> Optional[Tuple[str, int]]:
+        """Fetch URL through FlareSolverr"""
+        return self.flaresolverr_request(url)
+
+flaresolverr_session = FlareSolverrSession()
+
+def get_sitemap_from_robots_txt():
     try:
-        resp = session.post(
-            flaresolverr_url,
-            json={"cmd": "sessions.create", "session": session_id},
-            timeout=30,
-        )
-        if resp.status_code == 200 and resp.json().get("status") == "ok":
-            _thread_local.flaresolverr_session_id = session_id
-            return session_id
-        log(f"Failed creating FlareSolverr session for thread {threading.get_ident()}: {resp.text}", "WARNING")
+        robots_url = f"{CURR_URL}/robots.txt"
+        content, status = flaresolverr_session.fetch(robots_url)
+        
+        if content and status == 200:
+            sitemap_url = None
+            for line in content.split('\n'):
+                if line.lower().startswith('sitemap:'):
+                    sitemap_url = line.split(':', 1)[1].strip()
+                    break
+            
+            if sitemap_url:
+                print(f"Extracted Sitemap URL: {sitemap_url}")
+                return sitemap_url
+            else:
+                print("No Sitemap directive found in robots.txt")
+                return None
+        else:
+            print(f"Error fetching robots.txt: Status {status}")
+            return None
+            
     except Exception as e:
-        log(f"Failed creating FlareSolverr session for thread {threading.get_ident()}: {e}", "WARNING")
-    return None
+        print(f"Error fetching robots.txt: {e}")
+        return None
 
-def flaresolverr_request(url: str, max_retries: int = 3) -> Optional[Tuple[str, int]]:
-    session, headers = get_flaresolverr_session()
-    flaresolverr_url = get_thread_flaresolverr_url()
-    flaresolverr_session_id = get_flaresolverr_browser_session_id(session, flaresolverr_url)
-
-    for attempt in range(max_retries):
-        try:
-            payload = {
-                "cmd": "request.get",
-                "url": url,
-                "maxTimeout": 120000,
-                "headers": headers,
-            }
-            if flaresolverr_session_id:
-                payload["session"] = flaresolverr_session_id
-
-            response = session.post(
-                flaresolverr_url,
-                json=payload,
-                timeout=FLARESOLVERR_TIMEOUT,
-            )
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("status") == "ok":
-                    solution = result.get("solution", {})
-                    content = solution.get("response", "")
-                    for cookie in solution.get("cookies", []):
-                        session.cookies.set(
-                            cookie.get("name"),
-                            cookie.get("value"),
-                            domain=cookie.get("domain"),
-                        )
-                    if "headers" in solution:
-                        for key, value in solution["headers"].items():
-                            if key.lower() not in ["content-length", "content-encoding", "transfer-encoding"]:
-                                headers[key] = value
-                    return content, 200
-                message = result.get("message", "")
-                if "session" in message.lower() and "exist" in message.lower():
-                    if hasattr(_thread_local, "flaresolverr_session_id"):
-                        delattr(_thread_local, "flaresolverr_session_id")
-                    flaresolverr_session_id = get_flaresolverr_browser_session_id(session, flaresolverr_url)
-
-            log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}")
-        except requests.exceptions.Timeout:
-            log(f"FlareSolverr timeout on attempt {attempt + 1} for {url}")
-        except requests.exceptions.ConnectionError:
-            log(f"FlareSolverr connection error on attempt {attempt + 1} for {url}")
-        except Exception as e:
-            log(f"FlareSolverr error on attempt {attempt + 1} for {url}: {e}")
-
-        if attempt < max_retries - 1:
-            time.sleep((2 ** attempt) + random.uniform(0, 1))
-    return None, 0
-
+def check_robots_txt():
+    """Check robots.txt for crawl delays and sitemap location"""
+    robots_url = f"{CURR_URL}/robots.txt"
+    log(f"Checking robots.txt: {robots_url}")
+    
+    content, status = flaresolverr_session.fetch(robots_url)
+    if content and status == 200:
+        lines = content.split('\n')
+        crawl_delay = None
+        sitemap_url = None
+        
+        for line in lines:
+            line = line.strip()
+            if line.lower().startswith('sitemap:'):
+                parts = line.split(':', 1)
+                if len(parts) > 1:
+                    potential_url = parts[1].strip()
+                    if potential_url.startswith('http'):
+                        sitemap_url = potential_url
+                        log(f"Found valid sitemap in robots.txt: {sitemap_url}")
+            elif line.lower().startswith('crawl-delay:'):
+                try:
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        crawl_delay = float(parts[1].strip())
+                        log(f"Found Crawl-delay: {crawl_delay} seconds")
+                except (ValueError, IndexError) as e:
+                    log(f"Error parsing crawl-delay: {e}")
+        
+        return crawl_delay, sitemap_url
+    
+    log("No robots.txt found or couldn't fetch it")
+    return None, None
 
 class RequestManager:
     def __init__(self):
         self.request_count = 0
         self.last_request_time = 0
         self.retry_delays = [1, 2, 4]
-        self._lock = threading.Lock()
-        self._thread_local = threading.local()
-
-    def _respect_rate_limit(self):
-        if REQUEST_DELAY_BASE <= 0:
-            return
-        if not hasattr(self._thread_local, "last_request_time"):
-            self._thread_local.last_request_time = 0.0
-
-        elapsed = time.time() - self._thread_local.last_request_time
-        if elapsed < REQUEST_DELAY_BASE:
-            time.sleep(REQUEST_DELAY_BASE - elapsed)
-        self._thread_local.last_request_time = time.time()
-
-        with self._lock:
-            self.request_count += 1
-
-    def fetch(self, url: str, retry_count: int = 0) -> Optional[str]:
+        
+    def _respect_rate_limit(self, crawl_delay=None):
+        current_time = time.time()
+        if self.request_count > 0:
+            elapsed = current_time - self.last_request_time
+            base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
+            min_delay = base_delay * 0.8
+            max_delay = base_delay * 1.5
+            target_delay = random.uniform(0, 1)
+            
+            if elapsed < target_delay:
+                sleep_time = target_delay - elapsed
+                time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+        self.request_count += 1
+        
+        if self.request_count % 20 == 0:
+            long_pause = random.uniform(0, 1)
+            log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
+            time.sleep(long_pause)
+    
+    def fetch(self, url: str, retry_count: int = 0, crawl_delay=None) -> Optional[str]:
         if retry_count >= len(self.retry_delays):
             log(f"Max retries exceeded for {url}")
             return None
-
-        self._respect_rate_limit()
-        content, status = flaresolverr_request(url)
-
+        
+        self._respect_rate_limit(crawl_delay)
+        content, status = flaresolverr_session.fetch(url)
+        
         if content and status == 200:
             return content
-
+        
         if status in [403, 429, 503]:
             delay = self.retry_delays[retry_count] + random.uniform(0, 1)
-            log(f"HTTP {status} for {url}, retry {retry_count + 1} in {delay:.1f}s")
+            log(f"HTTP {status} for {url} , retry {retry_count+1} in {delay:.1f}s")
             time.sleep(delay)
-            return self.fetch(url, retry_count + 1)
-        if status == 404:
+            return self.fetch(url, retry_count + 1, crawl_delay)
+        elif status == 404:
+            log(f"URL not found: {url}")
             return None
-        if status not in [0, 200]:
+        
+        if status != 200 and status != 0:
             delay = self.retry_delays[retry_count]
+            log(f"Retry {retry_count+1} for {url} in {delay}s (status: {status})")
             time.sleep(delay)
-            return self.fetch(url, retry_count + 1)
+            return self.fetch(url, retry_count + 1, crawl_delay)
+        
         return None
 
-# Initialize global request manager
 request_manager = RequestManager()
 
-# ================= HTTP FUNCTIONS =================
+def http_get(url: str, crawl_delay=None) -> Optional[str]:
+    return request_manager.fetch(url, crawl_delay=crawl_delay)
 
-def http_get(url: str) -> Optional[str]:
-    return request_manager.fetch(url)
-
-def load_xml(url: str) -> Optional[ET.Element]:
-    data = http_get(url)
+def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
+    data = http_get(url, crawl_delay)
     if not data:
         return None
     try:
-        xml_text = extract_xml_payload(data)
-        return ET.fromstring(xml_text)
+        return ET.fromstring(data)
     except ET.ParseError as e:
         log(f"XML parse error for {url}: {e}")
         return None
 
-def normalize_image(url: str) -> str:
+csv_lock = threading.Lock()
+
+def normalize_image_url(url: str) -> str:
     if not url:
         return ""
+    
     if url.startswith("//"):
         return "https:" + url
     elif url.startswith("/"):
-        return CURR_URL + url
+        return f"{CURR_URL}{url}"
+    elif not url.startswith("http"):
+        return f"https://ak1.ostkcdn.com{url}" if 'ostkcdn.com' not in url else f"https://{url}"
+    
     return url
 
+def extract_product_info_from_html(html: str, product_url: str) -> dict:
+    """
+    Parse product HTML and return a dictionary with all required fields.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    info = {}
 
-def extract_loc_values(root: ET.Element) -> list[str]:
-    ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-    elements = root.findall(".//ns:loc", ns)
-    if not elements:
-        elements = root.findall(".//loc")
-    values = []
-    for elem in elements:
-        if elem.text:
-            values.append(elem.text.strip())
-    return values
+    # --- product_id ---
+    prod_input = soup.find('input', {'name': 'product'})
+    info['product_id'] = prod_input.get('value', '') if prod_input else ''
+
+    # --- sku & variation_id ---
+    sku_meta = soup.find('meta', {'itemprop': 'sku'})
+    info['sku'] = sku_meta.get('content', '') if sku_meta else ''
+    # Use the SKU as the variation ID for this bundle configuration
+    info['variation_id'] = info['sku']
+
+    # --- mpn ---
+    mpn_meta = soup.find('meta', {'itemprop': 'mpn'})
+    info['mpn'] = mpn_meta.get('content', '') if mpn_meta else ''
+
+    # --- name ---
+    name_h1 = soup.find('h1', {'itemprop': 'name'})
+    info['name'] = name_h1.get_text(strip=True) if name_h1 else ''
+
+    # --- brand ---
+    brand_meta = soup.find('meta', {'itemprop': 'brand'})
+    if brand_meta:
+        info['brand'] = brand_meta.get('content', '')
+    else:
+        brand_link = soup.find('a', href=lambda h: h and '/brand/' in h)
+        info['brand'] = brand_link.get_text(strip=True) if brand_link else ''
+
+    # --- category & category_url (from breadcrumbs) ---
+    info['category'] = ''
+    info['category_url'] = ''
+    breadcrumbs = soup.find('div', class_='breadcrumbs')
+    if breadcrumbs:
+        crumbs = breadcrumbs.find_all('li')
+        # Home (0), Bedroom (1), Bedroom Furniture (2), Bedroom Sets (3)
+        if len(crumbs) >= 4:
+            cat_li = crumbs[3]
+            cat_link = cat_li.find('a')
+            if cat_link:
+                info['category'] = cat_link.find('span').get_text(strip=True)
+                info['category_url'] = cat_link.get('href', '')
+
+    # --- price ---
+    price_meta = soup.find('meta', {'itemprop': 'price'})
+    if price_meta:
+        info['price'] = price_meta.get('content', '').strip()
+    else:
+        price_span = soup.find('span', {'class': 'price', 'id': re.compile(r'product-price-\d+')})
+        if price_span:
+            raw = price_span.get_text(strip=True).replace('$', '').replace(',', '')
+            info['price'] = raw.strip()
+        else:
+            info['price'] = ''
+
+    # --- main_image (full size) ---
+    img_meta = soup.find('meta', {'itemprop': 'image'})
+    if img_meta:
+        info['main_image'] = img_meta.get('content', '')
+    else:
+        img_main = soup.find('img', {'id': 'image-main'})
+        info['main_image'] = img_main.get('src', '') if img_main else ''
+
+    # --- quantity (global) ---
+    qty_input = soup.find('input', {'id': 'qty-input'})
+    info['quantity'] = qty_input.get('value', '1') if qty_input else '1'
+
+    # --- group_attr_1: selected bed size ---
+    bed_size = ''
+    # Look for the active Queen bed option (adjust class if King is selected)
+    active_bed = soup.find('li', class_='option-item-209551 selection-item-263524 active')
+    if active_bed:
+        text = active_bed.get_text()
+        match = re.search(r'\(([^)]+)\)', text)
+        if match:
+            bed_size = match.group(1)
+    info['group_attr_1'] = bed_size
+
+    # --- group_attr_2: color ---
+    color = ''
+    # Try from the "Additional Information" panel first
+    add_info = soup.find('div', class_='product-details')
+    if add_info:
+        for li in add_info.find_all('li', class_='clearer'):
+            title_div = li.find('div', class_='title')
+            if title_div and 'Color' in title_div.get_text():
+                desc_div = li.find('div', class_='description')
+                if desc_div:
+                    color = desc_div.get_text(strip=True)
+                    break
+    if not color:
+        # Fallback: look in the dimension/attribute list
+        color_li = soup.find('li', class_='clearer')
+        while color_li:
+            title = color_li.find('div', class_='title')
+            if title and 'Color' in title.get_text():
+                desc = color_li.find('div', class_='description')
+                if desc:
+                    color = desc.get_text(strip=True)
+                    break
+            color_li = color_li.find_next_sibling('li', class_='clearer')
+    info['group_attr_2'] = color
+
+    # --- status (availability) ---
+    status = ''
+    avail_link = soup.find('link', {'itemprop': 'availability'})
+    if avail_link:
+        href = avail_link.get('href', '')
+        if 'InStock' in href:
+            status = 'In Stock'
+        elif 'OutOfStock' in href:
+            status = 'Out of Stock'
+    if not status:
+        # Fallback from product details
+        status_li = soup.find('li', class_='clearer')
+        while status_li:
+            title = status_li.find('div', class_='title')
+            if title and 'Availability' in title.get_text():
+                desc = status_li.find('div', class_='description')
+                if desc:
+                    status = desc.get_text(strip=True)
+                    break
+            status_li = status_li.find_next_sibling('li', class_='clearer')
+    info['status'] = status
+
+    # --- additional_data: JSON with extra info (collection, dimensions, features) ---
+    additional = {}
+
+    # Collection
+    collection = ''
+    coll_link = soup.find('a', href=lambda h: h and '/collection/' in h)
+    if coll_link:
+        collection = coll_link.get_text(strip=True)
+    else:
+        coll_li = soup.find('li', class_='clearer')
+        while coll_li:
+            title = coll_li.find('div', class_='title')
+            if title and 'Collection' in title.get_text():
+                desc = coll_li.find('div', class_='description')
+                if desc:
+                    collection = desc.get_text(strip=True)
+                    break
+            coll_li = coll_li.find_next_sibling('li', class_='clearer')
+    additional['collection'] = collection
+
+    # Dimensions (extract from the dimensions tab)
+    dims = {}
+    dims_section = soup.find('div', class_='product-dimensions')
+    if dims_section:
+        for row in dims_section.find_all('li', class_='clearer'):
+            title_div = row.find('div', class_='title')
+            dims_div = row.find('div', class_='dimensions')
+            if title_div and dims_div:
+                piece = title_div.get_text(strip=True)
+                dims[piece] = dims_div.get_text(strip=True)
+    additional['dimensions'] = dims
+
+    # Features (from the Details tab)
+    features = []
+    details_section = soup.find('div', class_='product-details')
+    if details_section:
+        for li in details_section.find_all('li', class_='clearer'):
+            title_div = li.find('div', class_='title')
+            if title_div and 'Features' in title_div.get_text():
+                desc_div = li.find('div', class_='description')
+                if desc_div:
+                    raw = desc_div.get_text(separator='\n').strip()
+                    features = [f.strip() for f in raw.split('\n') if f.strip()]
+                    break
+    additional['features'] = features
+
+    info['additional_data'] = json.dumps(additional, ensure_ascii=False)
+
+    return info
 
 
-def is_nested_sitemap_url(url: str) -> bool:
-    lower = url.lower()
-    return lower.endswith(".xml") or lower.endswith(".xml.gz")
-
-
-def collect_product_urls_from_sitemap(sitemap_url: str, visited: set, depth: int = 0, max_depth: int = 10) -> list[str]:
-    if sitemap_url in visited:
-        return []
-    if depth > max_depth:
-        log(f"  ⚠️ Max nested sitemap depth reached at: {sitemap_url}")
-        return []
-
-    visited.add(sitemap_url)
-    xml_root = load_xml(sitemap_url)
-    if xml_root is None:
-        log(f"  ❌ Failed to parse sitemap XML: {sitemap_url}")
-        return []
-
-    loc_values = extract_loc_values(xml_root)
-    if not loc_values:
-        return []
-
-    tag = xml_root.tag.lower()
-    # Sitemap index nodes point to other sitemap XML files.
-    if "sitemapindex" in tag:
-        nested_urls = [u for u in loc_values if is_nested_sitemap_url(u)]
-        all_urls = []
-        for nested in nested_urls:
-            all_urls.extend(collect_product_urls_from_sitemap(nested, visited, depth + 1, max_depth))
-        return all_urls
-
-    # Some "urlset" files still contain nested XML links; handle that too.
-    nested_urls = [u for u in loc_values if is_nested_sitemap_url(u)]
-    if nested_urls and len(nested_urls) == len(loc_values):
-        all_urls = []
-        for nested in nested_urls:
-            all_urls.extend(collect_product_urls_from_sitemap(nested, visited, depth + 1, max_depth))
-        return all_urls
-
-    product_urls = []
-    for loc in loc_values:
-        if '.htm' in loc and not any(x in loc for x in ['--C', '--PC', 'sitemap', 'robots']):
-            product_urls.append(loc)
-    return product_urls
-
-# ================= SITEMAP HANDLER - FIXED =================
-
-def get_all_product_urls():
-    """Properly traverse sitemap index and extract product URLs"""
-    log("=" * 60)
-    log("SITEMAP TRAVERSAL STARTED")
-    log("=" * 60)
+def getBundleData(html):
+  
+    soup = BeautifulSoup(html, 'html.parser')
     
-    all_product_urls = []
-    sitemap_urls = []
+    # Find script tags containing Product.Bundle initialization
+    script_pattern = re.compile(r'var bundle = new Product\.Bundle\(({.*?})\);', re.DOTALL)
     
-    # STEP 1: Get robots.txt and find sitemap
-    robots_url = f"{CURR_URL}/robots.txt"
-    robots_content = http_get(robots_url)
+    # Look in all script tags
+    for script in soup.find_all('script'):
+        if script.string:
+            # Search for Product.Bundle pattern
+            match = script_pattern.search(script.string)
+            if match:
+                # Return the raw JSON string from the JavaScript object
+                return match.group(1).strip()
     
-    sitemap_index_url = SITEMAP_INDEX  # Default
-    
-    if robots_content:
-        for line in robots_content.split('\n'):
-            if line.lower().startswith('sitemap:'):
-                parts = line.split(':', 1)
-                if len(parts) > 1:
-                    potential_url = sanitize_url_text(parts[1].strip())
-                    if potential_url.startswith('http'):
-                        sitemap_index_url = potential_url
-                        log(f"✓ Found sitemap in robots.txt: {sitemap_index_url}")
-                        break
-    
-    # STEP 2: Load sitemap index
-    log(f"\n📂 Loading sitemap index: {sitemap_index_url}")
-    index_content = http_get(sitemap_index_url)
-    if not index_content:
-        log("❌ Failed to load sitemap index")
-        return []
-    
-    # Parse sitemap index
-    try:
-        root = ET.fromstring(extract_xml_payload(index_content))
-        
-        # Try with namespace first
-        ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        sitemap_elements = root.findall(".//ns:sitemap/ns:loc", ns)
-        
-        if not sitemap_elements:
-            # Try without namespace
-            sitemap_elements = root.findall(".//sitemap/loc")
-        
-        if not sitemap_elements:
-            # Try direct loc tags
-            sitemap_elements = root.findall(".//loc")
-        
-        for elem in sitemap_elements:
-            if elem.text:
-                sitemap_urls.append(elem.text)
-        
-        log(f"✓ Found {len(sitemap_urls)} sitemap URLs in index")
-        
-        # Print first few sitemaps
-        for i, url in enumerate(sitemap_urls[:5]):
-            log(f"  {i+1}. {url}")
-        if len(sitemap_urls) > 5:
-            log(f"  ... and {len(sitemap_urls)-5} more")
-            
-    except ET.ParseError as e:
-        log(f"❌ XML Parse error: {e}")
-        return []
-    
-    # STEP 3: Apply offset and limit
-    if MAX_SITEMAPS > 0:
-        sitemap_urls = sitemap_urls[SITEMAP_OFFSET:SITEMAP_OFFSET + MAX_SITEMAPS]
-    elif SITEMAP_OFFSET > 0:
-        sitemap_urls = sitemap_urls[SITEMAP_OFFSET:]
-    
-    log(f"\n📊 Processing {len(sitemap_urls)} sitemaps (offset: {SITEMAP_OFFSET})")
-    
-    # STEP 4: Process each sitemap recursively (handles nested XML sitemaps)
-    total_product_urls = 0
-    visited_sitemaps = set()
-    
-    for idx, sitemap_url in enumerate(sitemap_urls, 1):
-        log(f"\n[{idx}/{len(sitemap_urls)}] Processing sitemap: {sitemap_url}")
+    return None
 
-        product_urls = collect_product_urls_from_sitemap(sitemap_url, visited_sitemaps, depth=0, max_depth=10)
-
-        # Apply per-top-level-sitemap limit
-        if MAX_URLS_PER_SITEMAP > 0 and len(product_urls) > MAX_URLS_PER_SITEMAP:
-            product_urls = product_urls[:MAX_URLS_PER_SITEMAP]
-
-        log(f"  ✓ Found {len(product_urls)} product URLs")
-        all_product_urls.extend(product_urls)
-        total_product_urls += len(product_urls)
-
-        # Small delay between top-level sitemaps (optional)
-        if REQUEST_DELAY_BASE > 0 and idx < len(sitemap_urls):
-            time.sleep(0.5)
-    
-    # Remove duplicates
-    all_product_urls = list(set(all_product_urls))
-    log(f"\n{'='*60}")
-    log(f"✅ TOTAL: {len(all_product_urls)} unique product URLs found")
-    log(f"{'='*60}")
-    
-    return all_product_urls
-
-# ================= PRODUCT PARSER =================
 
 def parse_product_page(html, url):
     """Extract product data from HTML"""
@@ -526,14 +568,12 @@ def parse_product_page(html, url):
     except Exception as e:
         log(f"Parse error: {e}")
         return None
-
-# ================= PRODUCT PROCESSING =================
-
+    
 csv_lock = threading.Lock()
 seen_lock = threading.Lock()
 stats_lock = threading.Lock()
 
-def process_product_data(product_url: str, writer, seen: set, stats: dict):
+def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl_delay=None):
     """FP-FC style processing flow with thread-safe seen/stats handling."""
     with seen_lock:
         if product_url in seen:
@@ -601,17 +641,22 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
 # ================= MAIN =================
 
 def main():
-    global start_time
-    
-    start_time = time.time()
-    
-    log("=" * 60)
-    log("CYMAX SITEMAP TRAVERSAL SCRAPER")
-    log("=" * 60)
-    log(f"Delay: {REQUEST_DELAY_BASE}s | Workers: {MAX_WORKERS}")
-    
+    crawl_delay, robots_sitemap = check_robots_txt()
+    crawl_delay = 0  # Override for this site (adjust if needed)
+
+    # ------------------------------------------------------------------
+    # MODE 0: Process URL list file with offset + limit (workflow chunk mode)
+    # ------------------------------------------------------------------
     if PRODUCT_URLS_FILE:
-        log(f"Chunk mode enabled with PRODUCT_URLS_FILE={PRODUCT_URLS_FILE}")
+        log("=" * 60)
+        log("SCRAPER STARTED – URL FILE CHUNK MODE")
+        log(f"PRODUCT_URLS_FILE: {PRODUCT_URLS_FILE}")
+        log(f"URL_OFFSET: {URL_OFFSET}")
+        log(f"URL_LIMIT: {URL_LIMIT}")
+        log(f"CHUNK_ID: {CHUNK_ID}")
+        log(f"OUTPUT_CSV: {OUTPUT_CSV}")
+        log("=" * 60)
+
         try:
             if PRODUCT_URLS_FILE.lower().endswith(".csv"):
                 with open(PRODUCT_URLS_FILE, "r", encoding="utf-8") as f:
@@ -626,52 +671,264 @@ def main():
                 with open(PRODUCT_URLS_FILE, "r", encoding="utf-8") as f:
                     all_urls = [line.strip() for line in f if line.strip()]
         except Exception as e:
-            log(f"❌ Failed to read PRODUCT_URLS_FILE: {e}")
+            log(f"❌ Failed to read PRODUCT_URLS_FILE: {e}", "ERROR")
             sys.exit(1)
 
         # Unique while preserving order
         all_product_urls = list(dict.fromkeys(all_urls))
         start = max(URL_OFFSET, 0)
-        if URL_LIMIT > 0:
-            product_urls = all_product_urls[start:start + URL_LIMIT]
-        else:
-            product_urls = all_product_urls[start:]
-        if MAX_PRODUCTS > 0 and len(product_urls) > MAX_PRODUCTS:
-            product_urls = product_urls[:MAX_PRODUCTS]
+        end = start + URL_LIMIT if URL_LIMIT > 0 else len(all_product_urls)
+        urls_to_process = all_product_urls[start:end]
+
         log(
-            f"Chunk selection => total_unique={len(all_product_urls)} "
-            f"offset={start} limit={URL_LIMIT} selected={len(product_urls)}"
+            f"URL file has {len(all_product_urls)} unique URLs. "
+            f"Processing {len(urls_to_process)} (offset={start}, limit={URL_LIMIT if URL_LIMIT > 0 else 'all'})"
         )
-    else:
-        # Get all product URLs by traversing sitemap index
-        all_product_urls = get_all_product_urls()
-        
-        if not all_product_urls:
-            log("❌ No product URLs found")
+        if not urls_to_process:
+            log("No URLs to process in this chunk – exiting.")
+            sys.exit(0)
+
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Ref Product URL",
+                "Ref Product ID",
+                "Ref Varient ID",
+                "Ref Category",
+                "Ref Category URL",
+                "Ref Brand Name",
+                "Ref Product Name",
+                "Set Includes Name",
+                "Ref SKU",
+                "Ref MPN",
+                "Ref GTIN",
+                "Ref Price",
+                "Ref Main Image",
+                "Ref Quantity",
+                "Ref Group Attr 1",
+                "Ref Group Attr 2",
+                "Ref Status",
+                "Additional Product Data",
+                "Date Scrapped"
+            ])
+
+            seen = set()
+            stats = {
+                'sitemaps_processed': 0,
+                'urls_processed': 0,
+                'products_fetched': 0,
+                'errors': 0
+            }
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
+                    for url in urls_to_process
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        log(f"Error in thread execution: {e}", "ERROR")
+                        stats['errors'] += 1
+
+            gc.collect()
+
+        log("=" * 60)
+        log("URL FILE CHUNK STATISTICS")
+        log("=" * 60)
+        log(f"Chunk ID:           {CHUNK_ID}")
+        log(f"URLs processed:     {stats['urls_processed']}")
+        log(f"Products fetched:   {stats['products_fetched']}")
+        log(f"Errors:             {stats['errors']}")
+        if stats['urls_processed'] > 0:
+            success_rate = (stats['products_fetched'] / stats['urls_processed']) * 100
+            log(f"Success rate:       {success_rate:.1f}%")
+        log(f"Chunk output saved: {OUTPUT_CSV}")
+        log("=" * 60)
+        return
+    
+    # ------------------------------------------------------------------
+    # MODE 1: Process a SINGLE SITEMAP with offset + limit (chunk mode)
+    # ------------------------------------------------------------------
+    if SITEMAP_URL:
+        log("=" * 60)
+        log("SCRAPER STARTED – CHUNK MODE (single sitemap with offset/limit)")
+        log(f"SITEMAP_URL: {SITEMAP_URL}")
+        log(f"URL_OFFSET: {URL_OFFSET}")
+        log(f"MAX_URLS_PER_SITEMAP (limit): {MAX_URLS_PER_SITEMAP}")
+        log(f"CHUNK_ID: {CHUNK_ID}")
+        log(f"OUTPUT_CSV: {OUTPUT_CSV}")
+        log("=" * 60)
+
+        # Load the sitemap
+        xml = load_xml(SITEMAP_URL, crawl_delay)
+        if not xml:
+            log(f"Failed to load sitemap: {SITEMAP_URL}", "ERROR")
             sys.exit(1)
-        
-        # Apply global product limit
-        if MAX_PRODUCTS > 0:
-            product_urls = all_product_urls[:MAX_PRODUCTS]
-            log(f"\n🎯 Limited to first {MAX_PRODUCTS} products")
+
+        # Extract all product URLs (same filtering as before)
+        ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        urls = []
+        for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+            elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+            if elements:
+                urls = [
+                    e.text.strip()
+                    for e in elements
+                    if e.text
+                    and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
+                    and ('.html' in e.text)
+                ]
+                if urls:
+                    break
+
+        if not urls:
+            log(f"No product URLs found in sitemap: {SITEMAP_URL}", "WARNING")
+            sys.exit(0)
+
+        total_urls = len(urls)
+        start = URL_OFFSET
+        # limit = 0 means "all remaining"
+        end = start + MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else total_urls
+        urls_to_process = urls[start:end]
+
+        log(f"Sitemap contains {total_urls} product URLs. Processing {len(urls_to_process)} URLs (offset {start})")
+        if not urls_to_process:
+            log("No URLs to process in this chunk – exiting.")
+            sys.exit(0)
+
+        # Initialize CSV and write header
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Ref Product URL",
+                "Ref Product ID",
+                "Ref Varient ID",
+                "Ref Category",
+                "Ref Category URL",
+                "Ref Brand Name",
+                "Ref Product Name",
+                "Set Includes Name",
+                "Ref SKU",
+                "Ref MPN",
+                "Ref GTIN",
+                "Ref Price",
+                "Ref Main Image",
+                "Ref Quantity",
+                "Ref Group Attr 1",
+                "Ref Group Attr 2",
+                "Ref Status",
+                "Additional Product Data",
+                "Date Scrapped"
+            ])
+
+            seen = set()
+            stats = {
+                'sitemaps_processed': 1,
+                'urls_processed': 0,
+                'products_fetched': 0,
+                'errors': 0
+            }
+
+            # Process URLs with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
+                    for url in urls_to_process
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        log(f"Error in thread execution: {e}", "ERROR")
+                        stats['errors'] += 1
+
+            gc.collect()
+
+        # Statistics for this chunk
+        log("=" * 60)
+        log("CHUNK SCRAPING STATISTICS")
+        log("=" * 60)
+        log(f"Chunk ID:           {CHUNK_ID}")
+        log(f"Sitemap:            {SITEMAP_URL}")
+        log(f"URLs processed:     {stats['urls_processed']}")
+        log(f"Products fetched:   {stats['products_fetched']}")
+        log(f"Errors:             {stats['errors']}")
+        if stats['urls_processed'] > 0:
+            success_rate = (stats['products_fetched'] / stats['urls_processed']) * 100
+            log(f"Success rate:       {success_rate:.1f}%")
+        log("=" * 60)
+        log(f"Chunk output saved: {OUTPUT_CSV}")
+        log("=" * 60)
+        return
+
+    # ------------------------------------------------------------------
+    # MODE 2: Process a SITEMAP INDEX (original behaviour)
+    # ------------------------------------------------------------------
+    log("=" * 60)
+    log("SCRAPER STARTED – SITEMAP INDEX MODE")
+    log(f"FlareSolverr URL: {FLARESOLVERR_URL}")
+    log(f"Timestamp: {SCRAPED_DATE}")
+    log(f"Base URL: {CURR_URL}")
+    log(f"Sitemap Index: {SITEMAP_INDEX}")
+    log(f"Sitemap Offset: {SITEMAP_OFFSET}")
+    log(f"Max Sitemaps: {MAX_SITEMAPS if MAX_SITEMAPS > 0 else 'All'}")
+    log(f"Max URLs per Sitemap: {MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else 'All'}")
+    log(f"Max Workers: {MAX_WORKERS}")
+    log(f"Request Delay: {REQUEST_DELAY_BASE}s")
+    log(f"Sample Size for Checking: {SAMPLE_SIZE}")
+    log("=" * 60)
+
+    sitemap = SITEMAP_INDEX
+    if robots_sitemap and robots_sitemap.startswith('http'):
+        sitemap = robots_sitemap
+        log(f"Using sitemap from robots.txt: {sitemap}")
+    else:
+        if robots_sitemap:
+            log(f"Invalid sitemap URL in robots.txt: '{robots_sitemap}', using default")
         else:
-            product_urls = all_product_urls
-    
-    log(f"📋 Processing {len(product_urls)} products")
-    
-    # Create CSV file
-    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+            log(f"No valid sitemap in robots.txt, using default: {sitemap}")
+
+    log(f"Loading sitemap index from {sitemap}")
+    index = load_xml(sitemap, crawl_delay)
+    if index is None:
+        log("Failed to load sitemap index", "ERROR")
+        sys.exit(1)
+
+    ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    sitemaps = []
+    for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+        elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+        if elements:
+            sitemaps = [e.text.strip() for e in elements if e.text]
+            break
+
+    if not sitemaps:
+        log("No sitemaps found with XML parsing, trying regex", "WARNING")
+        # (regex fallback could be added, but we assume XML works)
+
+    if SITEMAP_OFFSET >= len(sitemaps):
+        log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
+        sys.exit(0)
+
+    end_index = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemaps)
+    sitemaps_to_process = sitemaps[SITEMAP_OFFSET:end_index]
+
+    log(f"Total sitemaps found: {len(sitemaps)}")
+    log(f"Sitemaps to process: {len(sitemaps_to_process)}")
+
+    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        
-        # Write header
         writer.writerow([
             "Ref Product URL",
             "Ref Product ID",
-            "Ref Variant ID",
+            "Ref Varient ID",
             "Ref Category",
             "Ref Category URL",
             "Ref Brand Name",
             "Ref Product Name",
+            "Set Includes Name",
             "Ref SKU",
             "Ref MPN",
             "Ref GTIN",
@@ -681,75 +938,102 @@ def main():
             "Ref Group Attr 1",
             "Ref Group Attr 2",
             "Ref Status",
-            "Date Scraped"
+            "Additional Product Data",
+            "Date Scrapped"
         ])
-        
+
         seen = set()
         stats = {
-            "urls_processed": 0,
-            "products_fetched": 0,
-            "errors": 0,
+            'sitemaps_processed': 0,
+            'urls_processed': 0,
+            'products_fetched': 0,
+            'errors': 0
         }
-        
-        # Process with thread pool
-        log(f"\n🚀 Starting processing with {MAX_WORKERS} workers...")
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            
-            for url in product_urls:
-                future = executor.submit(
-                    process_product_data,
-                    url, writer, seen, stats
-                )
-                futures.append(future)
-            
-            # Monitor progress
-            completed = 0
-            total = len(futures)
-            
-            for future in as_completed(futures):
-                completed += 1
-                
-                if completed % 25 == 0 or completed == total:
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    eta = (total - completed) / rate if rate > 0 else 0
-                    log(f"📊 Progress: {completed}/{total} ({completed/total*100:.1f}%) | Rate: {rate:.1f}/s | ETA: {eta:.0f}s")
-                
-                try:
-                    future.result()
-                except Exception as e:
-                    log(f"Future error: {e}")
-                    with stats_lock:
-                        stats["errors"] += 1
-    
-    # Final summary
-    elapsed = time.time() - start_time
-    
-    log("\n" + "=" * 60)
-    log("✅ SCRAPING COMPLETE")
+
+        for sitemap_url in sitemaps_to_process:
+            stats['sitemaps_processed'] += 1
+            log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
+
+            xml = load_xml(sitemap_url, crawl_delay)
+            if not xml:
+                log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
+                continue
+
+            urls = []
+            for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                if elements:
+                    urls = [
+                        e.text.strip()
+                        for e in elements
+                        if e.text
+                        and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
+                        and ('.html' in e.text)
+                    ]
+                    if urls:
+                        break
+
+            if not urls:
+                log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
+                continue
+
+            if MAX_URLS_PER_SITEMAP > 0:
+                original_count = len(urls)
+                urls = urls[:MAX_URLS_PER_SITEMAP]
+                log(f"Limited to {len(urls)} out of {original_count} URLs")
+            else:
+                log(f"Found {len(urls)} product URLs in this sitemap")
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
+                    for url in urls
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        log(f"Error in thread execution: {e}", "ERROR")
+                        stats['errors'] += 1
+
+            gc.collect()
+
+    # Statistics
     log("=" * 60)
-    log(f"📁 Output: {OUTPUT_CSV}")
-    log(f"✅ Success: {stats['products_fetched']}")
-    log(f"❌ Failed: {stats['errors']}")
-    log(f"🔢 URLs processed: {stats['urls_processed']}")
-    log(f"⏱️  Time: {elapsed:.1f}s")
-    avg_speed = (stats['products_fetched'] / elapsed) if elapsed > 0 else 0
-    log(f"⚡ Avg speed: {avg_speed:.1f} products/sec")
-    log(f"📊 Total requests: {request_manager.request_count}")
-    
-    # Show sample
-    if stats["products_fetched"] > 0:
-        log("\n📋 Sample products:")
-        try:
-            with open(OUTPUT_CSV, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-                for i, row in enumerate(rows[1:4], 1):
-                    log(f"  {i}. ID: {row[1]} | {row[6][:50]}... | ${row[10]}")
-        except:
-            pass
+    log("SCRAPING STATISTICS")
+    log("=" * 60)
+    log(f"Sitemaps processed: {stats['sitemaps_processed']}")
+    log(f"URLs processed: {stats['urls_processed']}")
+    log(f"Products successfully fetched: {stats['products_fetched']}")
+    log(f"Errors encountered: {stats['errors']}")
+    if stats['urls_processed'] > 0:
+        success_rate = (stats['products_fetched'] / stats['urls_processed']) * 100
+        log(f"Success rate: {success_rate:.1f}%")
+    log("=" * 60)
+    log(f"Completed: {OUTPUT_CSV}")
+    log("=" * 60)
 
 if __name__ == "__main__":
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if not CURR_URL:
+        log("Error: CURR_URL environment variable is required", "ERROR")
+        sys.exit(1)
+
+    # Test FlareSolverr connection (only warn on failure)
+    if FLARESOLVERR_URL:
+        log(f"Testing FlareSolverr connection at {FLARESOLVERR_URL}")
+        try:
+            test_response = requests.post(FLARESOLVERR_URL, json={"cmd": "sessions.list"}, timeout=10)
+            if test_response.status_code == 200:
+                log("✓ FlareSolverr connection successful")
+            else:
+                log(f"⚠ FlareSolverr returned status {test_response.status_code}")
+        except Exception as e:
+            log(f"⚠ FlareSolverr connection failed: {e}")
+            log("Continuing anyway, but requests may fail...")
+    else:
+        log("⚠ FLARESOLVERR_URL not set, requests will use direct HTTP (may fail behind Cloudflare)")
+
     main()

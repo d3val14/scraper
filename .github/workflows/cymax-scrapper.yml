@@ -1,4 +1,4 @@
-name: Cymax Scraper with FlareSolverr (URL Chunks)
+name: Cymax Scraper with FlareSolverr (Chunked)
 
 on:
   workflow_dispatch:
@@ -8,32 +8,36 @@ on:
         required: true
         default: "https://www.cymax.com"
       total_sitemaps:
-        description: "How many top-level sitemaps to scan in planning"
+        description: "Total sitemaps to process (0 = auto)"
         default: "13"
       urls_per_sitemap:
-        description: "Max URLs to include from one sitemap (0 = all)"
-        default: "0"
-      chunk_size:
-        description: "URLs per scrape job"
+        description: "Max URLs to take from one sitemap (0 = all)"
+        default: "1000"
+      urls_per_job:
+        description: "Max URLs to process per job (splits large sitemaps)"
         default: "50000"
       max_workers:
-        description: "Parallel requests per scrape job"
+        description: "Parallel requests per job"
         default: "6"
-      flaresolverr_instances:
-        description: "FlareSolverr instances per job (0 = same as max_workers)"
-        default: "0"
       request_delay:
-        description: "Delay between requests in scraper"
+        description: "Delay between requests (seconds)"
         default: "0"
+      sample_size:
+        description: "URLs to sample for product detection"
+        default: "5"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
     outputs:
       matrix: ${{ steps.generate_matrix.outputs.matrix }}
       site_name: ${{ steps.get_site_name.outputs.site_name }}
-      total_urls: ${{ steps.generate_matrix.outputs.total_urls }}
-      chunk_count: ${{ steps.generate_matrix.outputs.chunk_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,52 +49,25 @@ jobs:
           echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
           echo "Site name extracted: $SITE_NAME"
 
-      - name: Start FlareSolverr pool
-        id: flaresolverr_pool
+      - name: Wait for FlareSolverr to be ready
         run: |
-          INSTANCES="${{ github.event.inputs.flaresolverr_instances }}"
-          MAX_WORKERS="${{ github.event.inputs.max_workers }}"
-          if [ -z "$INSTANCES" ] || [ "$INSTANCES" = "0" ]; then
-            INSTANCES="$MAX_WORKERS"
-          fi
-          if [ "$INSTANCES" -lt 1 ]; then
-            INSTANCES=1
-          fi
-
-          BASE_PORT=8191
-          URLS=""
-          echo "Starting $INSTANCES FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            docker run -d --name "$NAME" --cap-add=SYS_ADMIN -p "${PORT}:8191" ghcr.io/flaresolverr/flaresolverr:latest >/dev/null
-          done
-
-          echo "Waiting for all FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            URL="http://localhost:${PORT}/v1"
-            READY=0
-            for attempt in {1..45}; do
-              if curl -s -f -X POST "$URL" -H "Content-Type: application/json" -d '{"cmd":"sessions.list"}' > /dev/null 2>&1; then
-                READY=1
-                echo "✓ $NAME ready"
-                break
-              fi
-              sleep 2
-            done
-            if [ "$READY" -ne 1 ]; then
-              echo "❌ $NAME failed to start"
-              docker logs "$NAME" || true
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
               exit 1
             fi
-            if [ -z "$URLS" ]; then URLS="$URL"; else URLS="$URLS,$URL"; fi
           done
-
-          echo "instances=$INSTANCES" >> $GITHUB_OUTPUT
-          echo "urls=$URLS" >> $GITHUB_OUTPUT
-          echo "first_url=http://localhost:8191/v1" >> $GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -98,36 +75,23 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+        run: pip install requests beautifulsoup4
 
-      - name: Generate URL chunks matrix
+      - name: Generate chunk matrix
         id: generate_matrix
         env:
           CURR_URL: ${{ github.event.inputs.url }}
           MAX_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
-          CHUNK_SIZE: ${{ github.event.inputs.chunk_size }}
-          MAX_WORKERS: ${{ github.event.inputs.max_workers }}
-          FLARESOLVERR_URL: ${{ steps.flaresolverr_pool.outputs.first_url }}
-          FLARESOLVERR_URLS: ${{ steps.flaresolverr_pool.outputs.urls }}
-        run: |
-          python cymax/generate_chunks.py
-          test -f cymax_chunk_urls.csv
-          wc -l cymax_chunk_urls.csv
+          URLS_PER_JOB: ${{ github.event.inputs.urls_per_job }}
+          SITEMAP_OFFSET: 0
+          FLARESOLVERR_URL: http://localhost:8191/v1
+        run: python fpfc/generate_chunks.py
 
-      - name: Upload URL list artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cymax_url_list
-          path: cymax_chunk_urls.csv
-          if-no-files-found: error
-
-      - name: Stop FlareSolverr pool
-        if: always()
+      - name: Debug matrix output
         run: |
-          docker ps -a --format '{{.Names}}' | grep '^flaresolverr_' | xargs -r docker rm -f
+          echo "Generated matrix:"
+          echo '${{ steps.generate_matrix.outputs.matrix }}' | jq . || echo "Not valid JSON"
 
   scrape:
     needs: plan
@@ -136,57 +100,27 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download URL list
-        uses: actions/download-artifact@v4
-        with:
-          name: cymax_url_list
-          path: .
-
-      - name: Start FlareSolverr pool
-        id: flaresolverr_pool
+      - name: Wait for FlareSolverr
         run: |
-          INSTANCES="${{ github.event.inputs.flaresolverr_instances }}"
-          MAX_WORKERS="${{ github.event.inputs.max_workers }}"
-          if [ -z "$INSTANCES" ] || [ "$INSTANCES" = "0" ]; then
-            INSTANCES="$MAX_WORKERS"
-          fi
-          if [ "$INSTANCES" -lt 1 ]; then
-            INSTANCES=1
-          fi
-          BASE_PORT=8191
-          URLS=""
-          echo "Starting $INSTANCES FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            docker run -d --name "$NAME" --cap-add=SYS_ADMIN -p "${PORT}:8191" ghcr.io/flaresolverr/flaresolverr:latest >/dev/null
-          done
-          echo "Waiting for all FlareSolverr instances..."
-          for ((i=0; i<INSTANCES; i++)); do
-            PORT=$((BASE_PORT + i))
-            NAME="flaresolverr_${PORT}"
-            URL="http://localhost:${PORT}/v1"
-            READY=0
-            for attempt in {1..45}; do
-              if curl -s -f -X POST "$URL" -H "Content-Type: application/json" -d '{"cmd":"sessions.list"}' > /dev/null 2>&1; then
-                READY=1
-                break
-              fi
-              sleep 2
-            done
-            if [ "$READY" -ne 1 ]; then
-              echo "❌ $NAME failed to start"
-              docker logs "$NAME" || true
-              exit 1
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr ready"
+              break
             fi
-            if [ -z "$URLS" ]; then URLS="$URL"; else URLS="$URLS,$URL"; fi
+            sleep 2
           done
-          echo "instances=$INSTANCES" >> $GITHUB_OUTPUT
-          echo "urls=$URLS" >> $GITHUB_OUTPUT
-          echo "first_url=http://localhost:8191/v1" >> $GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -194,35 +128,26 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4 lxml
 
-      - name: Run Cymax scraper chunk
+      - name: Run scraper chunk
         id: scrape_run
         continue-on-error: true
         env:
-          CURR_URL: ${{ github.event.inputs.url }}
-          PRODUCT_URLS_FILE: cymax_chunk_urls.csv
+          SITEMAP_URL: ${{ matrix.sitemap_url }}
           URL_OFFSET: ${{ matrix.offset }}
-          URL_LIMIT: ${{ matrix.limit }}
+          MAX_URLS_PER_SITEMAP: ${{ matrix.limit }}
           CHUNK_ID: ${{ matrix.chunk_id }}
-          MAX_PRODUCTS: 0
+          CURR_URL: ${{ matrix.base_url }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
-          FLARESOLVERR_URL: ${{ steps.flaresolverr_pool.outputs.first_url }}
-          FLARESOLVERR_URLS: ${{ steps.flaresolverr_pool.outputs.urls }}
+          SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
+          FLARESOLVERR_URL: http://localhost:8191/v1
         run: |
-          echo "Chunk ID: $CHUNK_ID"
-          echo "URL_OFFSET: $URL_OFFSET"
-          echo "URL_LIMIT: $URL_LIMIT"
+          echo "Processing chunk $CHUNK_ID"
+          echo "Sitemap: $SITEMAP_URL"
+          echo "Offset: $URL_OFFSET, Limit: $MAX_URLS_PER_SITEMAP"
           python cymax/cymax.py || echo "Scraper failed with exit code $?"
-          ls -la cymax_products_*.csv 2>/dev/null || echo "No CSV files generated"
-
-      - name: Stop FlareSolverr pool
-        if: always()
-        run: |
-          docker ps -a --format '{{.Names}}' | grep '^flaresolverr_' | xargs -r docker rm -f
 
       - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
@@ -255,6 +180,8 @@ jobs:
             exit 0
           else
             echo "has_files=true" >> $GITHUB_OUTPUT
+            echo "Found CSV files:"
+            echo "$CSV_FILES"
             CHUNK_COUNT=$(echo "$CSV_FILES" | wc -l)
             echo "chunk_count=$CHUNK_COUNT" >> $GITHUB_OUTPUT
           fi
@@ -263,17 +190,24 @@ jobs:
         id: merge_csv
         if: steps.check_files.outputs.has_files == 'true'
         run: |
+          echo "Merging CSV chunks..."
           CSV_FILES=$(find chunks -name "cymax_products_*.csv")
           FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
+          echo "Using header from: $FIRST_FILE"
           head -n 1 "$FIRST_FILE" > cymax_products_full.csv
+          TOTAL_ROWS=0
           FILE_COUNT=0
           for f in $CSV_FILES; do
             if [ -f "$f" ]; then
               FILE_COUNT=$((FILE_COUNT + 1))
+              ROWS=$(tail -n +2 "$f" 2>/dev/null | wc -l || echo "0")
+              TOTAL_ROWS=$((TOTAL_ROWS + ROWS))
+              echo "Processing $f: $ROWS rows"
               tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> cymax_products_full.csv
             fi
           done
           FINAL_ROWS=$(tail -n +2 cymax_products_full.csv 2>/dev/null | wc -l || echo "0")
+          echo "Merged $FINAL_ROWS rows from $FILE_COUNT files"
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
           echo "final_rows=$FINAL_ROWS" >> $GITHUB_OUTPUT
 
@@ -281,9 +215,12 @@ jobs:
         id: meta
         run: |
           SITE_NAME="${{ needs.plan.outputs.site_name }}"
-          if [ -z "$SITE_NAME" ]; then SITE_NAME="cymax"; fi
+          if [ -z "$SITE_NAME" ]; then
+            SITE_NAME="cymax"
+          fi
           DATE=$(date +%F_%H%M%S)
           echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
+          echo "Generated filename: ${SITE_NAME}_${DATE}.csv"
 
       - name: Upload to FTP (if merge succeeded)
         if: steps.merge_csv.outputs.final_rows > 0
@@ -308,10 +245,55 @@ jobs:
           EOF
           echo "Upload completed: $FILE"
 
+      - name: Create summary report
+        run: |
+          SITE_NAME="${{ needs.plan.outputs.site_name }}"
+          SITE_URL="${{ github.event.inputs.url }}"
+          OUTPUT_FILE="${{ steps.meta.outputs.name }}"
+          FILE_COUNT="${{ steps.merge_csv.outputs.file_count || '0' }}"
+          TOTAL_ROWS="${{ steps.merge_csv.outputs.final_rows || '0' }}"
+          SUCCESSFUL_CHUNKS="${{ steps.check_files.outputs.chunk_count || '0' }}"
+          PLANNED_JOBS="${{ fromJson(needs.plan.outputs.matrix).length || '0' }}"
+          
+          echo "========================================="
+          echo "          SCRAPING SUMMARY"
+          echo "========================================="
+          echo "Site Name:       $SITE_NAME"
+          echo "Site URL:        $SITE_URL"
+          echo "Output File:     $OUTPUT_FILE"
+          echo ""
+          echo "Job Status:"
+          echo "  Planned Jobs:  $PLANNED_JOBS"
+          echo "  Successful:    $SUCCESSFUL_CHUNKS"
+          echo "  Failed:        $((PLANNED_JOBS - SUCCESSFUL_CHUNKS))"
+          echo ""
+          echo "Results:"
+          echo "  Total Files:    $FILE_COUNT chunks"
+          echo "  Total Products: $TOTAL_ROWS rows"
+          echo ""
+          echo "Configuration:"
+          echo "  Max Workers:   ${{ github.event.inputs.max_workers }}"
+          echo "  Request Delay: ${{ github.event.inputs.request_delay }}s"
+          echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
+          echo "  URLs/Job:      ${{ github.event.inputs.urls_per_job }}"
+          echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
+          echo "  FlareSolverr:  Enabled"
+          echo "========================================="
+          
+          if [ -f "cymax_products_full.csv" ]; then
+            echo ""
+            echo "First 3 rows of data:"
+            echo "======================"
+            head -n 4 cymax_products_full.csv
+          else
+            echo ""
+            echo "No data was successfully scraped!"
+          fi
+
       - name: Archive final results
         if: steps.merge_csv.outputs.final_rows > 0
         uses: actions/upload-artifact@v4
         with:
-          name: cymax_final_results
+          name: final_results
           path: cymax_products_full.csv
           retention-days: 7
