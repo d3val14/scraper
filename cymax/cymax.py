@@ -25,7 +25,7 @@ MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "500"))  # Limit pe
 MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "1000"))
 
 # Workers and delays
-MAX_WORKERS = min(int(os.getenv("MAX_WORKERS", "4")), 6)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "0.5"))  # Low delay
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 FLARESOLVERR_URLS_RAW = os.getenv("FLARESOLVERR_URLS", "").strip()
