@@ -607,8 +607,18 @@ def main():
     if PRODUCT_URLS_FILE:
         log(f"Chunk mode enabled with PRODUCT_URLS_FILE={PRODUCT_URLS_FILE}")
         try:
-            with open(PRODUCT_URLS_FILE, "r", encoding="utf-8") as f:
-                all_urls = [line.strip() for line in f if line.strip()]
+            if PRODUCT_URLS_FILE.lower().endswith(".csv"):
+                with open(PRODUCT_URLS_FILE, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames and "url" in [h.strip().lower() for h in reader.fieldnames]:
+                        all_urls = [str(row.get("url", "")).strip() for row in reader if str(row.get("url", "")).strip()]
+                    else:
+                        f.seek(0)
+                        raw = list(csv.reader(f))
+                        all_urls = [r[0].strip() for r in raw if r and r[0].strip() and r[0].strip().startswith("http")]
+            else:
+                with open(PRODUCT_URLS_FILE, "r", encoding="utf-8") as f:
+                    all_urls = [line.strip() for line in f if line.strip()]
         except Exception as e:
             log(f"❌ Failed to read PRODUCT_URLS_FILE: {e}")
             sys.exit(1)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import csv
 import json
 import os
 import random
@@ -22,6 +23,8 @@ MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "13"))
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "50000"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+PLAN_MAX_WORKERS = int(os.getenv("PLAN_MAX_WORKERS", "20"))
+FS_RETRIES = int(os.getenv("FS_RETRIES", "2"))
 
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 FLARESOLVERR_URLS_RAW = os.getenv("FLARESOLVERR_URLS", "").strip()
@@ -30,7 +33,7 @@ FLARESOLVERR_URLS = [u.strip() for u in FLARESOLVERR_URLS_RAW.split(",") if u.st
 if not FLARESOLVERR_URLS:
     FLARESOLVERR_URLS = [FLARESOLVERR_URL]
 
-URL_LIST_FILE = "cymax_chunk_urls.txt"
+URL_LIST_FILE = "cymax_chunk_urls.csv"
 
 
 def log(msg: str, level: str = "INFO") -> None:
@@ -111,7 +114,7 @@ def get_browser_session_id(session: requests.Session, fs_url: str) -> Optional[s
     return None
 
 
-def fs_get(url: str, retries: int = 3) -> Optional[str]:
+def fs_get(url: str, retries: int = FS_RETRIES) -> Optional[str]:
     session, headers = get_session()
     fs_url = get_thread_flaresolverr_url()
     session_id = get_browser_session_id(session, fs_url)
@@ -161,27 +164,23 @@ def get_sitemap_index_url() -> str:
     return SITEMAP_INDEX
 
 
-def collect_product_urls_from_sitemap(sitemap_url: str, visited: set, depth: int = 0, max_depth: int = 10) -> List[str]:
-    if sitemap_url in visited or depth > max_depth:
-        return []
-    visited.add(sitemap_url)
+def parse_sitemap(sitemap_url: str, depth: int = 0, max_depth: int = 10) -> Tuple[List[str], List[str]]:
+    if depth > max_depth:
+        return [], []
     root = load_xml(sitemap_url)
     if root is None:
-        return []
+        return [], []
     locs = extract_locs(root)
     if not locs:
-        return []
+        return [], []
 
     tag = root.tag.lower()
     nested = [u for u in locs if u.lower().endswith(".xml") or u.lower().endswith(".xml.gz")]
     if "sitemapindex" in tag or (nested and len(nested) == len(locs)):
-        out: List[str] = []
-        for n in nested:
-            out.extend(collect_product_urls_from_sitemap(n, visited, depth + 1, max_depth))
-        return out
+        return [], nested
 
     urls = [u for u in locs if ".htm" in u and not any(x in u for x in ["--C", "--PC", "sitemap", "robots"])]
-    return urls
+    return urls, []
 
 
 def main() -> None:
@@ -190,7 +189,8 @@ def main() -> None:
 
     log(
         f"Planner config => max_sitemaps={MAX_SITEMAPS}, chunk_size={CHUNK_SIZE}, "
-        f"max_workers={MAX_WORKERS}, max_urls_per_sitemap={MAX_URLS_PER_SITEMAP}"
+        f"max_workers={MAX_WORKERS}, plan_workers={PLAN_MAX_WORKERS}, "
+        f"max_urls_per_sitemap={MAX_URLS_PER_SITEMAP}, fs_retries={FS_RETRIES}"
     )
     log(f"FlareSolverr endpoints available: {len(FLARESOLVERR_URLS)}")
     for i, endpoint in enumerate(FLARESOLVERR_URLS, 1):
@@ -210,26 +210,47 @@ def main() -> None:
     log(f"Top-level sitemaps selected: {len(sitemap_locs)}")
 
     all_urls: List[str] = []
-    visited_lock = threading.Lock()
-    global_visited = set()
+    visited_sitemaps = set()
+    frontier: List[Tuple[str, int]] = [(s, 0) for s in sitemap_locs]
+    processed_sitemaps = 0
 
-    def process_one(sm_url: str) -> List[str]:
-        with visited_lock:
-            local_visited = set(global_visited)
-        urls = collect_product_urls_from_sitemap(sm_url, local_visited, 0, 10)
-        if MAX_URLS_PER_SITEMAP > 0 and len(urls) > MAX_URLS_PER_SITEMAP:
-            urls = urls[:MAX_URLS_PER_SITEMAP]
-        log(f"Sitemap done: {sm_url} -> {len(urls)} urls")
-        return urls
+    with ThreadPoolExecutor(max_workers=min(PLAN_MAX_WORKERS, max(1, len(sitemap_locs) * 2))) as ex:
+        while frontier:
+            batch = []
+            next_frontier: List[Tuple[str, int]] = []
+            for sm_url, depth in frontier:
+                if sm_url in visited_sitemaps:
+                    continue
+                visited_sitemaps.add(sm_url)
+                batch.append((sm_url, depth))
 
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(sitemap_locs)))) as ex:
-        futures = [ex.submit(process_one, s) for s in sitemap_locs]
-        completed = 0
-        total_sitemaps = len(futures)
-        for f in as_completed(futures):
-            all_urls.extend(f.result())
-            completed += 1
-            log(f"Sitemap progress: {completed}/{total_sitemaps} processed")
+            if not batch:
+                break
+
+            futures = {
+                ex.submit(parse_sitemap, sm_url, depth, 10): (sm_url, depth)
+                for sm_url, depth in batch
+            }
+            for f in as_completed(futures):
+                sm_url, depth = futures[f]
+                try:
+                    urls, nested = f.result()
+                except Exception as e:
+                    log(f"Failed parsing sitemap {sm_url}: {e}", "WARNING")
+                    urls, nested = [], []
+                if MAX_URLS_PER_SITEMAP > 0 and len(urls) > MAX_URLS_PER_SITEMAP:
+                    urls = urls[:MAX_URLS_PER_SITEMAP]
+                all_urls.extend(urls)
+                for n in nested:
+                    if n not in visited_sitemaps:
+                        next_frontier.append((n, depth + 1))
+                processed_sitemaps += 1
+                if processed_sitemaps % 10 == 0 or processed_sitemaps == len(visited_sitemaps):
+                    log(
+                        f"Sitemap progress: processed={processed_sitemaps}, "
+                        f"queued_next={len(next_frontier)}, urls_collected={len(all_urls)}"
+                    )
+            frontier = next_frontier
 
     # Unique preserving order
     unique_urls = list(dict.fromkeys(all_urls))
@@ -238,9 +259,11 @@ def main() -> None:
     if total == 0:
         raise RuntimeError("No product urls discovered")
 
-    with open(URL_LIST_FILE, "w", encoding="utf-8") as f:
+    with open(URL_LIST_FILE, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["url"])
         for u in unique_urls:
-            f.write(u + "\n")
+            writer.writerow([u])
 
     chunks = []
     for i, offset in enumerate(range(0, total, CHUNK_SIZE)):

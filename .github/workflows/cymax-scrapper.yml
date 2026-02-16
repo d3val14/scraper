@@ -114,14 +114,14 @@ jobs:
           FLARESOLVERR_URLS: ${{ steps.flaresolverr_pool.outputs.urls }}
         run: |
           python cymax/generate_chunks.py
-          test -f cymax_chunk_urls.txt
-          wc -l cymax_chunk_urls.txt
+          test -f cymax_chunk_urls.csv
+          wc -l cymax_chunk_urls.csv
 
       - name: Upload URL list artifact
         uses: actions/upload-artifact@v4
         with:
           name: cymax_url_list
-          path: cymax_chunk_urls.txt
+          path: cymax_chunk_urls.csv
           if-no-files-found: error
 
       - name: Stop FlareSolverr pool
@@ -203,7 +203,7 @@ jobs:
         continue-on-error: true
         env:
           CURR_URL: ${{ github.event.inputs.url }}
-          PRODUCT_URLS_FILE: cymax_chunk_urls.txt
+          PRODUCT_URLS_FILE: cymax_chunk_urls.csv
           URL_OFFSET: ${{ matrix.offset }}
           URL_LIMIT: ${{ matrix.limit }}
           CHUNK_ID: ${{ matrix.chunk_id }}
