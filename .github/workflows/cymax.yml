@@ -160,14 +160,14 @@ jobs:
       - name: Save scraper script
         run: |
           # Save your scraper code to a file
-          cat > cymax_scraper.py << 'EOF'
+          cat > cymax.py << 'EOF'
           ${{ github.workspace }}/scraper.py
           EOF
           
           # Since we can't directly use ${{ github.workspace }} in the heredoc,
           # we'll copy the actual file if it exists in the repo
           if [ -f "scraper.py" ]; then
-            cp scraper.py cymax_scraper.py
+            cp scraper.py cymax.py
           else
             echo "ERROR: scraper.py not found in repository!"
             exit 1
@@ -188,7 +188,7 @@ jobs:
           echo "  Workers: $MAX_WORKERS"
           echo "  Delay: $REQUEST_DELAY"
           
-          python cymax_scraper.py
+          python cymax.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
