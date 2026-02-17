@@ -68,7 +68,19 @@ def parse_flaresolverr_urls() -> List[str]:
         return [FLARESOLVERR_URL]
     return []
 
+def align_flaresolverr_hosts_with_workers(endpoints: List[str], workers: int) -> Tuple[List[str], int]:
+    configured_workers = max(1, workers)
+    if not endpoints:
+        return endpoints, configured_workers
+    if len(endpoints) >= configured_workers:
+        return endpoints[:configured_workers], configured_workers
+    return endpoints, len(endpoints)
+
 FLARESOLVERR_URLS = parse_flaresolverr_urls()
+FLARESOLVERR_URLS, EFFECTIVE_MAX_WORKERS = align_flaresolverr_hosts_with_workers(
+    FLARESOLVERR_URLS,
+    MAX_WORKERS,
+)
 thread_local = threading.local()
 fs_assign_lock = threading.Lock()
 fs_assign_count = 0
@@ -753,7 +765,7 @@ def main():
                 'errors': 0
             }
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=EFFECTIVE_MAX_WORKERS) as executor:
                 futures = [
                     executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
                     for url in urls_to_process
@@ -865,7 +877,7 @@ def main():
             }
 
             # Process URLs with ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=EFFECTIVE_MAX_WORKERS) as executor:
                 futures = [
                     executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
                     for url in urls_to_process
@@ -908,7 +920,8 @@ def main():
     log(f"Sitemap Offset: {SITEMAP_OFFSET}")
     log(f"Max Sitemaps: {MAX_SITEMAPS if MAX_SITEMAPS > 0 else 'All'}")
     log(f"Max URLs per Sitemap: {MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else 'All'}")
-    log(f"Max Workers: {MAX_WORKERS}")
+    log(f"Max Workers (configured): {MAX_WORKERS}")
+    log(f"Max Workers (effective): {EFFECTIVE_MAX_WORKERS}")
     log(f"Request Delay: {REQUEST_DELAY_BASE}s")
     log(f"Sample Size for Checking: {SAMPLE_SIZE}")
     log("=" * 60)
@@ -1017,7 +1030,7 @@ def main():
             else:
                 log(f"Found {len(urls)} product URLs in this sitemap")
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=EFFECTIVE_MAX_WORKERS) as executor:
                 futures = [
                     executor.submit(process_product_data, url, writer, seen, stats, crawl_delay)
                     for url in urls

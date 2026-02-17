@@ -44,7 +44,19 @@ def parse_flaresolverr_urls() -> List[str]:
         return [FLARESOLVERR_URL]
     return []
 
+def align_flaresolverr_hosts_with_workers(endpoints: List[str], workers: int) -> Tuple[List[str], int]:
+    configured_workers = max(1, workers)
+    if not endpoints:
+        return endpoints, configured_workers
+    if len(endpoints) >= configured_workers:
+        return endpoints[:configured_workers], configured_workers
+    return endpoints, len(endpoints)
+
 FLARESOLVERR_URLS = parse_flaresolverr_urls()
+FLARESOLVERR_URLS, EFFECTIVE_CHUNK_GEN_WORKERS = align_flaresolverr_hosts_with_workers(
+    FLARESOLVERR_URLS,
+    CHUNK_GEN_WORKERS,
+)
 thread_local = threading.local()
 assign_lock = threading.Lock()
 assign_count = 0
@@ -232,7 +244,8 @@ end = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemap_locs)
 sitemap_locs = sitemap_locs[SITEMAP_OFFSET:end]
 
 print(f"Total sitemaps to analyze: {len(sitemap_locs)}")
-print(f"Chunk generator workers: {CHUNK_GEN_WORKERS}")
+print(f"Chunk generator workers (configured): {CHUNK_GEN_WORKERS}")
+print(f"Chunk generator workers (effective): {EFFECTIVE_CHUNK_GEN_WORKERS}")
 print(f"FlareSolverr endpoints: {', '.join(FLARESOLVERR_URLS) if FLARESOLVERR_URLS else 'none'}")
 
 # ---------- 2. For each sitemap, count product URLs ----------
@@ -257,7 +270,7 @@ def process_sitemap(sm_url):
         total = MAX_URLS_PER_SITEMAP
     return {"url": sm_url, "total_urls": total}
 
-worker_count = max(1, min(CHUNK_GEN_WORKERS, len(sitemap_locs)))
+worker_count = max(1, min(EFFECTIVE_CHUNK_GEN_WORKERS, len(sitemap_locs)))
 with ThreadPoolExecutor(max_workers=worker_count) as executor:
     futures = [executor.submit(process_sitemap, url) for url in sitemap_locs]
     for future in as_completed(futures):

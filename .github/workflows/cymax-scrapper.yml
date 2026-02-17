@@ -88,8 +88,21 @@ jobs:
           CHUNK_GEN_WORKERS: ${{ github.event.inputs.max_workers }}
           FLARESOLVERR_TIMEOUT: 180
           FLARESOLVERR_URL: http://localhost:8191/v1
-          FLARESOLVERR_URLS: http://localhost:8191/v1
-        run: python cymax/generate_chunks.py
+        run: |
+          FS_WORKERS="${CHUNK_GEN_WORKERS:-1}"
+          if ! [[ "$FS_WORKERS" =~ ^[0-9]+$ ]] || [ "$FS_WORKERS" -lt 1 ]; then
+            FS_WORKERS=1
+          fi
+          FLARESOLVERR_URLS=""
+          for ((i=1; i<=FS_WORKERS; i++)); do
+            if [ -n "$FLARESOLVERR_URLS" ]; then
+              FLARESOLVERR_URLS="${FLARESOLVERR_URLS},"
+            fi
+            FLARESOLVERR_URLS="${FLARESOLVERR_URLS}http://localhost:8191/v1"
+          done
+          export FLARESOLVERR_URLS
+          echo "Using $FS_WORKERS FlareSolverr host entries"
+          python cymax/generate_chunks.py
 
       - name: Debug matrix output
         run: |
@@ -146,11 +159,23 @@ jobs:
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
           SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
           FLARESOLVERR_URL: http://localhost:8191/v1
-          FLARESOLVERR_URLS: http://localhost:8191/v1
         run: |
+          FS_WORKERS="${MAX_WORKERS:-1}"
+          if ! [[ "$FS_WORKERS" =~ ^[0-9]+$ ]] || [ "$FS_WORKERS" -lt 1 ]; then
+            FS_WORKERS=1
+          fi
+          FLARESOLVERR_URLS=""
+          for ((i=1; i<=FS_WORKERS; i++)); do
+            if [ -n "$FLARESOLVERR_URLS" ]; then
+              FLARESOLVERR_URLS="${FLARESOLVERR_URLS},"
+            fi
+            FLARESOLVERR_URLS="${FLARESOLVERR_URLS}http://localhost:8191/v1"
+          done
+          export FLARESOLVERR_URLS
           echo "Processing chunk $CHUNK_ID"
           echo "Sitemap: $SITEMAP_URL"
           echo "Offset: $URL_OFFSET, Limit: $MAX_URLS_PER_SITEMAP"
+          echo "Using $FS_WORKERS FlareSolverr host entries"
           python cymax/cymax.py || echo "Scraper failed with exit code $?"
 
       - name: Upload chunk artifact
