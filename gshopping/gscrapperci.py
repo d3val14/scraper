@@ -16,7 +16,6 @@ import csv
 import traceback
 import pandas as pd
 import argparse
-
 # Import the existing captcha solving functions
 try:
     from solvecaptcha import solve_recaptcha_audio
@@ -61,6 +60,8 @@ def setup_driver():
     options.add_argument("--disable-ipc-flooding-protection")
     options.add_argument("--enable-features=NetworkService,NetworkServiceInProcess")
     options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+    options.add_argument("--disable-site-isolation-trials")
 
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -70,7 +71,9 @@ def setup_driver():
     ]
     options.add_argument(f"user-agent={random.choice(user_agents)}")
 
-    driver = uc.Chrome(options=options)
+    
+    # driver = uc.Chrome(options=options)
+    driver = uc.Chrome(options=options,version_main=144)
     return driver
 
 def detects_recaptcha(driver):
@@ -92,20 +95,40 @@ def detects_recaptcha(driver):
         print(f"Error detecting reCAPTCHA: {e}")
         return False
 
+# In your main gscrapperci.py, update the handle_captcha function:
+
 def handle_captcha(driver, url):
-    """Handle captcha if detected"""
-    recaptcha = detects_recaptcha(driver)
-    if recaptcha:
-        print("Attempting to solve captcha...")
-        result = solve_recaptcha_audio(driver)
-        if result == "solved":
-            print("Captcha solved successfully!")
-            driver.switch_to.default_content()
-            return "solved"
+    """Handle captcha if detected with retry logic"""
+    max_retries = 1
+
+    for attempt in range(max_retries):
+        recaptcha = detects_recaptcha(driver)
+        if recaptcha:
+            print(f"Attempt {attempt + 1}/{max_retries} to solve captcha...")
+            result = solve_recaptcha_audio(driver)
+            
+            if result == "solved":
+                print("Captcha solved successfully!")
+                driver.switch_to.default_content()
+                return "solved"
+            else:
+                print(f"Captcha solving attempt {attempt + 1} failed")
+                
+                # if attempt < max_retries - 1:
+                #     # Try refreshing the page
+                #     print("Refreshing page and retrying...")
+                #     driver.refresh()
+                #     time.sleep(5)
+                # else:
+                #     print("All captcha solving attempts failed")
+                #     return "failed"
+                print("All captcha solving attempts failed")
+                return "failed"
         else:
-            print(f"Captcha solving failed: {result}")
-            return "failed"
-    return "no_captcha"
+            print("No reCAPTCHA found.")
+            return "no_captcha"
+    
+    return "failed"
 
 def start_new_driver(search_url):
     """Start a new driver and handle captcha if present"""
@@ -140,7 +163,7 @@ def download_csv_from_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, remote_filenam
         print(f"Downloading {remote_filename} from FTP...")
         
         ftp = ftplib.FTP()
-        ftp.connect(ftp_host, 21)
+        ftp.connect(ftp_host, int(os.getenv("FTP_PORT", 21)))
         ftp.login(ftp_user, ftp_pass)
         ftp.set_pasv(True)
         
@@ -326,7 +349,15 @@ def scrape_product(driver, product_id, keyword, url):
                 'last_response': 'Captcha solving failed',
                 'status': 'captcha_failed',
                 'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'competitors': []
+                'product_url': '',  # ADD THIS LINE
+                'seller': '',  # ADD THIS LINE
+                'product_name': '',  # ADD THIS LINE
+                'cid': '',  # ADD THIS LINE
+                'pid': '',  # ADD THIS LINE
+                'osb_position': 0,  # ADD THIS LINE
+                'osb_id': '',  # ADD THIS LINE
+                'seller_count': 0,  # ADD THIS LINE
+                'competitors': []  # Already present
             }
         
         time.sleep(random.uniform(5, 10))
@@ -586,23 +617,24 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
         csv1_data = []
         for result in product_results:
             csv1_row = {
-                'product_id': result['product_id'],
-                'web_id': result['web_id'],
-                'keyword': result['keyword'],
-                'url': result['url'],
-                'osb_url': result['osb_url'],
-                'last_response': result['last_response'],
-                'product_url': result['product_url'],
-                'seller': result['seller'],
-                'product_name': result['product_name'],
-                'cid': result['cid'],
-                'pid': result['pid'],
-                'last_fetched_date': result['last_fetched_date'],
-                'osb_position': result['osb_position'],
-                'osb_id': result['osb_id'],
-                'seller_count': result['seller_count'],
-                'status': result['status']
+                'product_id': result.get('product_id', ''),
+                'web_id': result.get('web_id', ''),
+                'keyword': result.get('keyword', ''),
+                'url': result.get('url', ''),
+                'osb_url': result.get('osb_url', ''),
+                'last_response': result.get('last_response', ''),
+                'product_url': result.get('product_url', ''),
+                'seller': result.get('seller', ''),
+                'product_name': result.get('product_name', ''),
+                'cid': result.get('cid', ''),
+                'pid': result.get('pid', ''),
+                'last_fetched_date': result.get('last_fetched_date', ''),
+                'osb_position': result.get('osb_position', 0),
+                'osb_id': result.get('osb_id', ''),
+                'seller_count': result.get('seller_count', 0),
+                'status': result.get('status', 'error')
             }
+
             csv1_data.append(csv1_row)
         
         # Create CSV 2: Seller Information
@@ -637,12 +669,12 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
             pd.DataFrame(csv2_data).to_csv(csv2_path, index=False)
             print(f"✓ Saved seller info: {csv2_filename}")
         
-        # Upload to FTP
-        if csv1_data:
-            upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, csv1_path, csv1_filename)
+        # Upload to FTP STOPPED TO AVOID UNNECESSARY FTP USAGE DURING TESTING
+        # if csv1_data:
+        #     upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, csv1_path, csv1_filename)
         
-        if csv2_data:
-            upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, csv2_path, csv2_filename)
+        # if csv2_data:
+        #     upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, csv2_path, csv2_filename)
         
         print(f"\n✓ Chunk {chunk_id} processing completed")
         return True
