@@ -4,140 +4,85 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Base site URL (default: https://www.cymax.com)"
-        required: false
+        description: "Base site URL"
+        required: true
         default: "https://www.cymax.com"
-      sitemap_offset:
-        description: "Starting offset for sitemap processing"
+      total_sitemaps:
+        description: "Total sitemaps to process (0 = auto)"
         default: "0"
-      max_products:
-        description: "Maximum products to scrape (0 = unlimited)"
+      sitemaps_per_job:
+        description: "Sitemaps per parallel job"
+        default: "2"
+      urls_per_sitemap:
+        description: "Max URLs per sitemap"
         default: "100"
       max_workers:
-        description: "Parallel requests (recommended 2-4 for Cloudflare)"
+        description: "Parallel requests per job (recommended 2-4 for Cloudflare)"
         default: "3"
       request_delay:
-        description: "Base delay between requests in seconds"
+        description: "Base delay between requests (seconds)"
         default: "3.0"
 
 env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-  discover:
+  plan:
     runs-on: ubuntu-latest
     outputs:
-      total_products: ${{ steps.discovery.outputs.total_products }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      site_name: ${{ steps.get_site_name.outputs.site_name }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
+      - name: Get site name from URL
+        id: get_site_name
         run: |
-          python -m pip install --upgrade pip
-          pip install cloudscraper beautifulsoup4 lxml
-
-      - name: Discover product URLs
-        id: discovery
-        env:
-          CURR_URL: ${{ github.event.inputs.url }}
+          URL="${{ github.event.inputs.url }}"
+          # Extract site name from URL (remove protocol, www, and domain extension)
+          SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
+          echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
+          echo "Site name extracted: $SITE_NAME"
+      
+      - name: Generate job matrix
+        id: matrix
         run: |
-          echo "Discovering product URLs from: ${{ github.event.inputs.url }}"
+          TOTAL=${{ github.event.inputs.total_sitemaps }}
+          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
+          URL="${{ github.event.inputs.url }}"
+          REQ_DELAY="${{ github.event.inputs.request_delay }}"
+          MAX_WORKERS="${{ github.event.inputs.max_workers }}"
+          URLS_PER_SITEMAP="${{ github.event.inputs.urls_per_sitemap }}"
           
-          # Create a quick discovery script
-          cat > discover.py << 'EOF'
-          import os
-          import sys
-          import cloudscraper
-          import re
-          from urllib.parse import urljoin
-          
-          CURR_URL = os.getenv("CURR_URL", "https://www.cymax.com").rstrip("/")
-          
-          scraper = cloudscraper.create_scraper(
-              browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-              delay=10
-          )
-          
-          def extract_urls_from_sitemap(content):
-              urls = []
-              # Look for <loc> tags
-              url_pattern = r'<loc>\s*(https?://[^<]+)\s*</loc>'
-              matches = re.findall(url_pattern, content)
-              urls.extend(matches)
-              
-              # Look for .htm URLs
-              htm_pattern = r'https?://[^\s<>"]+\.htm'
-              matches = re.findall(htm_pattern, content)
-              urls.extend(matches)
-              
-              return list(set(urls))
-          
-          def discover_product_urls():
-              all_urls = set()
-              
-              # Try sitemap.xml
-              sitemap_url = f"{CURR_URL}/sitemap.xml"
-              print(f"Checking: {sitemap_url}")
-              
-              try:
-                  content = scraper.get(sitemap_url, timeout=30)
-                  if content and content.status_code == 200:
-                      urls = extract_urls_from_sitemap(content.text)
-                      all_urls.update(urls)
-              except Exception as e:
-                  print(f"Error fetching sitemap: {e}")
-              
-              # Filter to product URLs
-              product_urls = [url for url in all_urls if '.htm' in url and CURR_URL in url]
-              product_urls = [url for url in product_urls if not any(x in url for x in ['--C', '--PC', 'robots', 'sitemap'])]
-              
-              return product_urls
-          
-          urls = discover_product_urls()
-          print(f"Discovered {len(urls)} product URLs")
-          
-          # Save first few as sample
-          with open('discovered_urls.txt', 'w') as f:
-              for url in urls[:10]:  # Save first 10 as sample
-                  f.write(f"{url}\n")
-          
-          print(f"total_products={len(urls)}")
-          EOF
-          
-          python discover.py | tee discovery_output.txt
-          TOTAL_PRODUCTS=$(grep "total_products=" discovery_output.txt | cut -d= -f2 || echo "0")
-          
-          if [ -z "$TOTAL_PRODUCTS" ] || [ "$TOTAL_PRODUCTS" -eq 0 ]; then
-            echo "⚠️ No products discovered, using default estimate"
-            TOTAL_PRODUCTS=500
+          # If total is 0, use a default value for Cymax
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "Using default total sitemaps: 20"
+            TOTAL=20
           fi
           
-          echo "total_products=$TOTAL_PRODUCTS" >> $GITHUB_OUTPUT
+          # Calculate number of jobs
+          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
           
-          # Show sample URLs
-          if [ -f discovered_urls.txt ]; then
-            echo "### Sample discovered URLs:" >> $GITHUB_STEP_SUMMARY
-            cat discovered_urls.txt >> $GITHUB_STEP_SUMMARY
-          fi
+          # Build matrix JSON
+          MATRIX="["
+          for ((i=0;i<JOBS;i++)); do
+            OFFSET=$(( i * PER_JOB ))
+            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\",\"request_delay\":\"$REQ_DELAY\",\"max_workers\":\"$MAX_WORKERS\",\"urls_per_sitemap\":\"$URLS_PER_SITEMAP\"},"
+          done
+          MATRIX="${MATRIX%,}]"
+          
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Total sitemaps: $TOTAL"
+          echo "Sitemaps per job: $PER_JOB"
+          echo "Jobs planned: $JOBS"
+          echo "Matrix: $MATRIX"
 
   scrape:
-    needs: discover
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Create a matrix with just one job since we're using offset/limit
-        include:
-          - offset: ${{ github.event.inputs.sitemap_offset }}
-            max_products: ${{ github.event.inputs.max_products }}
-    # timeout-minutes: 120
-
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -159,148 +104,239 @@ jobs:
 
       - name: Save scraper script
         run: |
-          # Save your scraper code to a file
-          cat > cymax.py << 'EOF'
-          ${{ github.workspace }}/scraper.py
-          EOF
-          
-          # Since we can't directly use ${{ github.workspace }} in the heredoc,
-          # we'll copy the actual file if it exists in the repo
-          if [ -f "scraper.py" ]; then
-            cp scraper.py cymax.py
+          # Check if cymax_scraper.py exists in the repository
+          if [ -f "cymax_scraper.py" ]; then
+            cp cymax_scraper.py cymax_scraper.py
+            echo "Using existing cymax_scraper.py from repository"
           else
-            echo "ERROR: scraper.py not found in repository!"
+            echo "ERROR: cymax_scraper.py not found in repository!"
+            echo "Please ensure your scraper code is saved as cymax_scraper.py in the root directory"
             exit 1
           fi
 
       - name: Run Cymax scraper
         env:
-          CURR_URL: ${{ github.event.inputs.url }}
+          CURR_URL: ${{ matrix.url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
-          MAX_PRODUCTS: ${{ matrix.max_products }}
-          MAX_WORKERS: ${{ github.event.inputs.max_workers }}
-          REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          MAX_SITEMAPS: ${{ matrix.limit }}
+          MAX_URLS_PER_SITEMAP: ${{ matrix.urls_per_sitemap }}
+          MAX_PRODUCTS: ${{ matrix.urls_per_sitemap }}
+          MAX_WORKERS: ${{ matrix.max_workers }}
+          REQUEST_DELAY: ${{ matrix.request_delay }}
         run: |
-          echo "Starting Cymax scraper with:"
-          echo "  URL: $CURR_URL"
-          echo "  Offset: $SITEMAP_OFFSET"
-          echo "  Max Products: $MAX_PRODUCTS"
-          echo "  Workers: $MAX_WORKERS"
-          echo "  Delay: $REQUEST_DELAY"
+          echo "Starting Cymax scraper with configuration:"
+          echo "CURR_URL: $CURR_URL"
+          echo "SITEMAP_OFFSET: $SITEMAP_OFFSET"
+          echo "MAX_SITEMAPS: $MAX_SITEMAPS"
+          echo "MAX_URLS_PER_SITEMAP: $MAX_URLS_PER_SITEMAP"
+          echo "MAX_WORKERS: $MAX_WORKERS"
+          echo "REQUEST_DELAY: $REQUEST_DELAY"
+          echo ""
           
-          python cymax.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cymax_products_offset_${{ matrix.offset }}
-          path: cymax_products_*.csv
-          retention-days: 7
-
-      - name: Create summary
-        run: |
-          echo "## Scraping Results" >> $GITHUB_STEP_SUMMARY
-          echo "- **Target URL**: ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Offset**: ${{ matrix.offset }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Max Products**: ${{ matrix.max_products }}" >> $GITHUB_STEP_SUMMARY
+          # Run the Cymax scraper
+          python cymax_scraper.py
           
-          # Check if output file exists and show sample
-          CSV_FILE=$(ls cymax_products_*.csv 2>/dev/null | head -n 1)
-          if [ -f "$CSV_FILE" ]; then
-            ROWS=$(tail -n +2 "$CSV_FILE" | wc -l)
-            echo "- **Products scraped**: $ROWS" >> $GITHUB_STEP_SUMMARY
-            
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Sample Data (first 3 rows):" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            head -n 4 "$CSV_FILE" | column -t -s ',' >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **Status**: No products scraped" >> $GITHUB_STEP_SUMMARY
+          # List output files
+          echo ""
+          echo "Generated files:"
+          ls -la cymax_products_*.csv 2>/dev/null || echo "No CSV files generated yet"
+          
+          # Rename to match expected pattern for chunk upload
+          if [ -f "cymax_products_${SITEMAP_OFFSET}.csv" ]; then
+            cp "cymax_products_${SITEMAP_OFFSET}.csv" "products_chunk_${SITEMAP_OFFSET}.csv"
+            echo "Renamed to products_chunk_${SITEMAP_OFFSET}.csv for artifact upload"
           fi
 
-  # Optional: Add a merge job if you want to run multiple parallel chunks
+      - name: Upload chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk_${{ matrix.offset }}
+          path: products_chunk_*.csv
+          if-no-files-found: warn
+          retention-days: 1
+
   merge:
-    needs: scrape
+    needs: [plan, scrape]
     runs-on: ubuntu-latest
-    if: always() && github.event.inputs.sitemap_offset == '0'  # Only run for main job
-    permissions:
-      contents: write
+    if: always()
     
     steps:
-      - name: Download all artifacts
+      - name: Download all chunks
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          pattern: cymax_products_*
-          merge-multiple: false
+          path: chunks
+          pattern: chunk_*
+          merge-multiple: true
 
-      - name: Merge CSV files (if multiple)
+      - name: Merge CSV chunks
+        id: merge_csv
         run: |
-          echo "Checking for multiple CSV files..."
+          echo "Merging CSV chunks..."
+          
+          # Create chunks directory if it doesn't exist
+          mkdir -p chunks
           
           # Find all CSV files
-          find artifacts -name "*.csv" -type f | sort > csv_files.txt
+          CSV_FILES=$(find chunks -name "products_chunk_*.csv" 2>/dev/null || echo "")
           
-          if [ ! -s csv_files.txt ]; then
-            echo "No CSV files found to merge"
+          if [ -z "$CSV_FILES" ]; then
+            echo "WARNING: No CSV files found in artifacts!"
+            echo "Checking chunks directory contents:"
+            ls -la chunks/ 2>/dev/null || echo "chunks directory empty or not found"
+            
+            # Try to find any CSV files directly
+            CSV_FILES=$(find . -name "*.csv" -not -path "./chunks/*" 2>/dev/null | head -5 || echo "")
+            if [ -n "$CSV_FILES" ]; then
+              echo "Found CSV files outside chunks:"
+              echo "$CSV_FILES"
+              # Copy them to chunks for processing
+              for f in $CSV_FILES; do
+                cp "$f" "chunks/$(basename "$f")"
+              done
+              CSV_FILES=$(find chunks -name "*.csv" 2>/dev/null)
+            else
+              echo "ERROR: No CSV files found anywhere!"
+              exit 1
+            fi
+          fi
+          
+          echo "Found CSV files:"
+          echo "$CSV_FILES" | while read -r f; do
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              echo "  - $f ($(wc -l < "$f" | tr -d ' ') lines)"
+            fi
+          done
+          
+          # Get the first file for header
+          FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
+          if [ -z "$FIRST_FILE" ] || [ ! -f "$FIRST_FILE" ]; then
+            echo "ERROR: No valid CSV files found!"
+            exit 1
+          fi
+          
+          echo "Using header from: $FIRST_FILE"
+          
+          # Copy header
+          head -n 1 "$FIRST_FILE" > products_full.csv
+          
+          # Count and merge rows
+          TOTAL_ROWS=0
+          FILE_COUNT=0
+          echo "$CSV_FILES" | while read -r f; do
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              FILE_COUNT=$((FILE_COUNT + 1))
+              ROWS=$(tail -n +2 "$f" 2>/dev/null | wc -l | tr -d ' ')
+              TOTAL_ROWS=$((TOTAL_ROWS + ROWS))
+              echo "Processing $f: $ROWS rows"
+              tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> products_full.csv.tmp
+            fi
+          done
+          
+          # Move temp file to final
+          if [ -f "products_full.csv.tmp" ]; then
+            cat products_full.csv.tmp >> products_full.csv
+            rm products_full.csv.tmp
+          fi
+          
+          FINAL_ROWS=$(tail -n +2 products_full.csv 2>/dev/null | wc -l | tr -d ' ')
+          echo "Merged $FINAL_ROWS rows from $FILE_COUNT files"
+          
+          # Store counts for summary
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "final_rows=$FINAL_ROWS" >> $GITHUB_OUTPUT
+
+      - name: Build output filename
+        id: meta
+        run: |
+          SITE_NAME="${{ needs.plan.outputs.site_name }}"
+          if [ -z "$SITE_NAME" ]; then
+            SITE_NAME="cymax"
+          fi
+          DATE=$(date +%Y%m%d_%H%M%S)
+          echo "name=${SITE_NAME}_products_${DATE}.csv" >> $GITHUB_OUTPUT
+          echo "Generated filename: ${SITE_NAME}_products_${DATE}.csv"
+
+      - name: Upload to FTP (Optional)
+        if: success()
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_PATH: ${{ secrets.FTP_PATH }}
+          OUTPUT_FILE: ${{ steps.meta.outputs.name }}
+        run: |
+          if [ -z "$FTP_HOST" ] || [ -z "$FTP_USER" ] || [ -z "$FTP_PASS" ]; then
+            echo "FTP credentials not configured. Skipping FTP upload."
             exit 0
           fi
-          
-          FILE_COUNT=$(wc -l < csv_files.txt)
-          
-          if [ $FILE_COUNT -eq 1 ]; then
-            echo "Only one file found, copying directly"
-            cp $(cat csv_files.txt) merged_products.csv
-          else
-            echo "Merging $FILE_COUNT CSV files..."
-            
-            FIRST_FILE=$(head -n 1 csv_files.txt)
-            
-            # Create merged file with header from first file
-            head -n 1 "$FIRST_FILE" > merged_products.csv
-            
-            # Append data from all files (skip headers)
-            while IFS= read -r csv_file; do
-              echo "Adding: $csv_file"
-              tail -n +2 "$csv_file" >> merged_products.csv
-            done < csv_files.txt
-          fi
-          
-          # Count rows
-          if [ -f merged_products.csv ]; then
-            ROW_COUNT=$(tail -n +2 merged_products.csv | wc -l | tr -d ' ')
-            echo "Merged $ROW_COUNT product rows"
-          fi
 
-      - name: Generate output filename
-        id: filename
+          sudo apt-get update && sudo apt-get install -y lftp
+
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+          set ssl:verify-certificate no
+          set cmd:fail-exit yes
+          mkdir -p $FTP_PATH
+          cd $FTP_PATH
+          put products_full.csv -o $OUTPUT_FILE
+          ls -la $OUTPUT_FILE
+          bye
+          EOF
+
+          echo "FTP upload completed: $OUTPUT_FILE"
+
+      - name: Create summary report
         run: |
-          SITE=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|/.*||;s|\.|_|g')
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          echo "filename=${SITE}_products_${TIMESTAMP}.csv" >> $GITHUB_OUTPUT
+          SITE_NAME="${{ needs.plan.outputs.site_name }}"
+          SITE_URL="${{ github.event.inputs.url }}"
+          OUTPUT_FILE="${{ steps.meta.outputs.name }}"
+          FILE_COUNT="${{ steps.merge_csv.outputs.file_count }}"
+          TOTAL_ROWS="${{ steps.merge_csv.outputs.final_rows }}"
+          
+          echo "========================================="
+          echo "          SCRAPING SUMMARY"
+          echo "========================================="
+          echo "Site Name:       $SITE_NAME"
+          echo "Site URL:        $SITE_URL"
+          echo "Output File:     $OUTPUT_FILE"
+          echo "Total Chunks:    $FILE_COUNT"
+          echo "Total Products:  $TOTAL_ROWS"
+          echo ""
+          echo "Configuration:"
+          echo "  Max Workers:   ${{ github.event.inputs.max_workers }}"
+          echo "  Request Delay: ${{ github.event.inputs.request_delay }}s"
+          echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
+          echo "  Sitemaps/Job:  ${{ github.event.inputs.sitemaps_per_job }}"
+          echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
+          echo "========================================="
+          
+          # Show sample of data
+          if [ -f "products_full.csv" ]; then
+            echo ""
+            echo "First 3 rows of data:"
+            echo "======================"
+            echo ""
+            head -n 4 products_full.csv | column -t -s ',' | sed 's/^/  /'
+            
+            # Add to GitHub step summary
+            echo "## Scraping Results" >> $GITHUB_STEP_SUMMARY
+            echo "- **Site**: $SITE_NAME" >> $GITHUB_STEP_SUMMARY
+            echo "- **URL**: $SITE_URL" >> $GITHUB_STEP_SUMMARY
+            echo "- **Products Scraped**: $TOTAL_ROWS" >> $GITHUB_STEP_SUMMARY
+            echo "- **Output File**: $OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$TOTAL_ROWS" -gt 0 ]; then
+              echo "✅ Scraping completed successfully!" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ Warning: No products were scraped" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ No data file generated" >> $GITHUB_STEP_SUMMARY
+          fi
 
-      - name: Upload merged CSV
-        if: success() || failure()
+      - name: Archive final results
         uses: actions/upload-artifact@v4
         with:
-          name: merged_products
-          path: merged_products.csv
+          name: final_results_${{ needs.plan.outputs.site_name }}
+          path: |
+            products_full.csv
           retention-days: 7
-
-      - name: Create final summary
-        run: |
-          echo "## Final Scraping Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Target URL**: ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total discovered products**: ${{ needs.discover.outputs.total_products }}" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -f merged_products.csv ]; then
-            ROWS=$(tail -n +2 merged_products.csv | wc -l | tr -d ' ')
-            echo "- **Successfully scraped**: $ROWS products" >> $GITHUB_STEP_SUMMARY
-            echo "- **Output file**: ${{ steps.filename.outputs.filename }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Scraping completed successfully!" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **Status**: No products were scraped" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ Warning: Check the logs for errors" >> $GITHUB_STEP_SUMMARY
-          fi
