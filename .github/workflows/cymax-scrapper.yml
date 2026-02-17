@@ -47,8 +47,13 @@ jobs:
         id: flaresolverr_pool
         run: |
           INSTANCES="${{ github.event.inputs.max_workers }}"
+          PLAN_MAX_INSTANCES=4
           if ! [[ "$INSTANCES" =~ ^[0-9]+$ ]] || [ "$INSTANCES" -lt 1 ]; then
             INSTANCES=1
+          fi
+          if [ "$INSTANCES" -gt "$PLAN_MAX_INSTANCES" ]; then
+            echo "Capping plan FlareSolverr instances to $PLAN_MAX_INSTANCES (requested: $INSTANCES)"
+            INSTANCES="$PLAN_MAX_INSTANCES"
           fi
 
           BASE_PORT=8191
@@ -115,7 +120,7 @@ jobs:
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           URLS_PER_JOB: ${{ github.event.inputs.urls_per_job }}
           SITEMAP_OFFSET: 0
-          CHUNK_GEN_WORKERS: ${{ github.event.inputs.max_workers }}
+          CHUNK_GEN_WORKERS: ${{ steps.flaresolverr_pool.outputs.instances }}
           FLARESOLVERR_TIMEOUT: 180
           FLARESOLVERR_INSTANCES: ${{ steps.flaresolverr_pool.outputs.instances }}
           FLARESOLVERR_URL: ${{ steps.flaresolverr_pool.outputs.first_url }}
