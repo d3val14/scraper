@@ -1,0 +1,306 @@
+name: Cymax Product Scraper (Cloudflare Resistant)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Base site URL (default: https://www.cymax.com)"
+        required: false
+        default: "https://www.cymax.com"
+      sitemap_offset:
+        description: "Starting offset for sitemap processing"
+        default: "0"
+      max_products:
+        description: "Maximum products to scrape (0 = unlimited)"
+        default: "100"
+      max_workers:
+        description: "Parallel requests (recommended 2-4 for Cloudflare)"
+        default: "3"
+      request_delay:
+        description: "Base delay between requests in seconds"
+        default: "3.0"
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      total_products: ${{ steps.discovery.outputs.total_products }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cloudscraper beautifulsoup4 lxml
+
+      - name: Discover product URLs
+        id: discovery
+        env:
+          CURR_URL: ${{ github.event.inputs.url }}
+        run: |
+          echo "Discovering product URLs from: ${{ github.event.inputs.url }}"
+          
+          # Create a quick discovery script
+          cat > discover.py << 'EOF'
+          import os
+          import sys
+          import cloudscraper
+          import re
+          from urllib.parse import urljoin
+          
+          CURR_URL = os.getenv("CURR_URL", "https://www.cymax.com").rstrip("/")
+          
+          scraper = cloudscraper.create_scraper(
+              browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+              delay=10
+          )
+          
+          def extract_urls_from_sitemap(content):
+              urls = []
+              # Look for <loc> tags
+              url_pattern = r'<loc>\s*(https?://[^<]+)\s*</loc>'
+              matches = re.findall(url_pattern, content)
+              urls.extend(matches)
+              
+              # Look for .htm URLs
+              htm_pattern = r'https?://[^\s<>"]+\.htm'
+              matches = re.findall(htm_pattern, content)
+              urls.extend(matches)
+              
+              return list(set(urls))
+          
+          def discover_product_urls():
+              all_urls = set()
+              
+              # Try sitemap.xml
+              sitemap_url = f"{CURR_URL}/sitemap.xml"
+              print(f"Checking: {sitemap_url}")
+              
+              try:
+                  content = scraper.get(sitemap_url, timeout=30)
+                  if content and content.status_code == 200:
+                      urls = extract_urls_from_sitemap(content.text)
+                      all_urls.update(urls)
+              except Exception as e:
+                  print(f"Error fetching sitemap: {e}")
+              
+              # Filter to product URLs
+              product_urls = [url for url in all_urls if '.htm' in url and CURR_URL in url]
+              product_urls = [url for url in product_urls if not any(x in url for x in ['--C', '--PC', 'robots', 'sitemap'])]
+              
+              return product_urls
+          
+          urls = discover_product_urls()
+          print(f"Discovered {len(urls)} product URLs")
+          
+          # Save first few as sample
+          with open('discovered_urls.txt', 'w') as f:
+              for url in urls[:10]:  # Save first 10 as sample
+                  f.write(f"{url}\n")
+          
+          print(f"total_products={len(urls)}")
+          EOF
+          
+          python discover.py | tee discovery_output.txt
+          TOTAL_PRODUCTS=$(grep "total_products=" discovery_output.txt | cut -d= -f2 || echo "0")
+          
+          if [ -z "$TOTAL_PRODUCTS" ] || [ "$TOTAL_PRODUCTS" -eq 0 ]; then
+            echo "⚠️ No products discovered, using default estimate"
+            TOTAL_PRODUCTS=500
+          fi
+          
+          echo "total_products=$TOTAL_PRODUCTS" >> $GITHUB_OUTPUT
+          
+          # Show sample URLs
+          if [ -f discovered_urls.txt ]; then
+            echo "### Sample discovered URLs:" >> $GITHUB_STEP_SUMMARY
+            cat discovered_urls.txt >> $GITHUB_STEP_SUMMARY
+          fi
+
+  scrape:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Create a matrix with just one job since we're using offset/limit
+        include:
+          - offset: ${{ github.event.inputs.sitemap_offset }}
+            max_products: ${{ github.event.inputs.max_products }}
+    # timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cloudscraper beautifulsoup4 lxml requests
+
+      - name: Save scraper script
+        run: |
+          # Save your scraper code to a file
+          cat > cymax_scraper.py << 'EOF'
+          ${{ github.workspace }}/scraper.py
+          EOF
+          
+          # Since we can't directly use ${{ github.workspace }} in the heredoc,
+          # we'll copy the actual file if it exists in the repo
+          if [ -f "scraper.py" ]; then
+            cp scraper.py cymax_scraper.py
+          else
+            echo "ERROR: scraper.py not found in repository!"
+            exit 1
+          fi
+
+      - name: Run Cymax scraper
+        env:
+          CURR_URL: ${{ github.event.inputs.url }}
+          SITEMAP_OFFSET: ${{ matrix.offset }}
+          MAX_PRODUCTS: ${{ matrix.max_products }}
+          MAX_WORKERS: ${{ github.event.inputs.max_workers }}
+          REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+        run: |
+          echo "Starting Cymax scraper with:"
+          echo "  URL: $CURR_URL"
+          echo "  Offset: $SITEMAP_OFFSET"
+          echo "  Max Products: $MAX_PRODUCTS"
+          echo "  Workers: $MAX_WORKERS"
+          echo "  Delay: $REQUEST_DELAY"
+          
+          python cymax_scraper.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cymax_products_offset_${{ matrix.offset }}
+          path: cymax_products_*.csv
+          retention-days: 7
+
+      - name: Create summary
+        run: |
+          echo "## Scraping Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target URL**: ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Offset**: ${{ matrix.offset }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Max Products**: ${{ matrix.max_products }}" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if output file exists and show sample
+          CSV_FILE=$(ls cymax_products_*.csv 2>/dev/null | head -n 1)
+          if [ -f "$CSV_FILE" ]; then
+            ROWS=$(tail -n +2 "$CSV_FILE" | wc -l)
+            echo "- **Products scraped**: $ROWS" >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Sample Data (first 3 rows):" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -n 4 "$CSV_FILE" | column -t -s ',' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: No products scraped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Optional: Add a merge job if you want to run multiple parallel chunks
+  merge:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always() && github.event.inputs.sitemap_offset == '0'  # Only run for main job
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: cymax_products_*
+          merge-multiple: false
+
+      - name: Merge CSV files (if multiple)
+        run: |
+          echo "Checking for multiple CSV files..."
+          
+          # Find all CSV files
+          find artifacts -name "*.csv" -type f | sort > csv_files.txt
+          
+          if [ ! -s csv_files.txt ]; then
+            echo "No CSV files found to merge"
+            exit 0
+          fi
+          
+          FILE_COUNT=$(wc -l < csv_files.txt)
+          
+          if [ $FILE_COUNT -eq 1 ]; then
+            echo "Only one file found, copying directly"
+            cp $(cat csv_files.txt) merged_products.csv
+          else
+            echo "Merging $FILE_COUNT CSV files..."
+            
+            FIRST_FILE=$(head -n 1 csv_files.txt)
+            
+            # Create merged file with header from first file
+            head -n 1 "$FIRST_FILE" > merged_products.csv
+            
+            # Append data from all files (skip headers)
+            while IFS= read -r csv_file; do
+              echo "Adding: $csv_file"
+              tail -n +2 "$csv_file" >> merged_products.csv
+            done < csv_files.txt
+          fi
+          
+          # Count rows
+          if [ -f merged_products.csv ]; then
+            ROW_COUNT=$(tail -n +2 merged_products.csv | wc -l | tr -d ' ')
+            echo "Merged $ROW_COUNT product rows"
+          fi
+
+      - name: Generate output filename
+        id: filename
+        run: |
+          SITE=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|/.*||;s|\.|_|g')
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "filename=${SITE}_products_${TIMESTAMP}.csv" >> $GITHUB_OUTPUT
+
+      - name: Upload merged CSV
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged_products
+          path: merged_products.csv
+          retention-days: 7
+
+      - name: Create final summary
+        run: |
+          echo "## Final Scraping Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target URL**: ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total discovered products**: ${{ needs.discover.outputs.total_products }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f merged_products.csv ]; then
+            ROWS=$(tail -n +2 merged_products.csv | wc -l | tr -d ' ')
+            echo "- **Successfully scraped**: $ROWS products" >> $GITHUB_STEP_SUMMARY
+            echo "- **Output file**: ${{ steps.filename.outputs.filename }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Scraping completed successfully!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: No products were scraped" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Warning: Check the logs for errors" >> $GITHUB_STEP_SUMMARY
+          fi
