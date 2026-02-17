@@ -11,10 +11,12 @@ import json
 import time
 import requests
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Tuple
 from xml.etree import ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # ---------- ENV ----------
 CURR_URL = os.environ.get("CURR_URL", "").rstrip("/")
@@ -28,14 +30,59 @@ MAX_URLS_PER_SITEMAP = int(os.environ.get("MAX_URLS_PER_SITEMAP", "0"))
 URLS_PER_JOB = int(os.environ.get("URLS_PER_JOB", "500"))
 SITEMAP_OFFSET = int(os.environ.get("SITEMAP_OFFSET", "0"))
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL")
+FLARESOLVERR_URLS_ENV = os.environ.get("FLARESOLVERR_URLS", "")
+FLARESOLVERR_INSTANCES = int(os.environ.get("FLARESOLVERR_INSTANCES", "0"))
 CHUNK_GEN_WORKERS = int(os.environ.get("CHUNK_GEN_WORKERS", "2"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SitemapParser/1.0)"}
 
 FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
+def build_flaresolverr_pool_from_base(base_url: str, instances: int) -> List[str]:
+    if instances < 1 or not base_url:
+        return []
+    parsed = urlparse(base_url)
+    if not parsed.scheme or not parsed.hostname:
+        return []
+    base_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/v1"
+    return [
+        f"{parsed.scheme}://{parsed.hostname}:{base_port + i}{path}"
+        for i in range(instances)
+    ]
+
+def parse_flaresolverr_urls() -> List[str]:
+    urls = [u.strip() for u in FLARESOLVERR_URLS_ENV.split(",") if u.strip()]
+    if urls:
+        return urls
+    if FLARESOLVERR_INSTANCES > 0 and FLARESOLVERR_URL:
+        pooled = build_flaresolverr_pool_from_base(FLARESOLVERR_URL, FLARESOLVERR_INSTANCES)
+        if pooled:
+            return pooled
+    if FLARESOLVERR_URL:
+        return [FLARESOLVERR_URL]
+    return []
+
+def align_flaresolverr_hosts_with_workers(endpoints: List[str], workers: int) -> Tuple[List[str], int]:
+    configured_workers = max(1, workers)
+    if not endpoints:
+        return endpoints, configured_workers
+    if len(endpoints) >= configured_workers:
+        return endpoints[:configured_workers], configured_workers
+    return endpoints, len(endpoints)
+
+FLARESOLVERR_URLS = parse_flaresolverr_urls()
+FLARESOLVERR_URLS, EFFECTIVE_CHUNK_GEN_WORKERS = align_flaresolverr_hosts_with_workers(
+    FLARESOLVERR_URLS,
+    CHUNK_GEN_WORKERS,
+)
+thread_local = threading.local()
+assign_lock = threading.Lock()
+assign_count = 0
+
 class FlareSolverrSession:
-    def __init__(self):
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
         self.session = requests.Session()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -65,7 +112,7 @@ class FlareSolverrSession:
                 }
                 
                 response = self.session.post(
-                    FLARESOLVERR_URL,
+                    self.endpoint,
                     json=payload,
                     timeout=FLARESOLVERR_TIMEOUT
                 )
@@ -112,7 +159,17 @@ class FlareSolverrSession:
         """Fetch URL through FlareSolverr"""
         return self.flaresolverr_request(url)
 
-flaresolverr_session = FlareSolverrSession()
+def get_thread_flaresolverr_session() -> FlareSolverrSession:
+    global assign_count
+    if not hasattr(thread_local, "fs_session"):
+        if not FLARESOLVERR_URLS:
+            raise RuntimeError("FLARESOLVERR_URL or FLARESOLVERR_URLS is required")
+        with assign_lock:
+            endpoint = FLARESOLVERR_URLS[assign_count % len(FLARESOLVERR_URLS)]
+            assign_count += 1
+        thread_local.fs_session = FlareSolverrSession(endpoint)
+        log(f"Thread {threading.get_ident()} assigned FlareSolverr endpoint {endpoint}")
+    return thread_local.fs_session
 
 def log(msg: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -130,7 +187,7 @@ def check_robots_txt():
     robots_url = f"{CURR_URL}/robots.txt"
     log(f"Checking robots.txt: {robots_url}")
     
-    content, status = flaresolverr_session.fetch(robots_url)
+    content, status = get_thread_flaresolverr_session().fetch(robots_url)
     if content and status == 200:
         lines = content.split('\n')
         crawl_delay = None
@@ -164,20 +221,9 @@ def check_robots_txt():
 def fetch_xml(url):
     """Try normal GET first, fallback to FlareSolverr if needed."""
     try:
-        content, status = flaresolverr_session.fetch(url)
+        content, status = get_thread_flaresolverr_session().fetch(url)
         if status == 200:
             return content
-        elif status in (403, 503) and FLARESOLVERR_URL:
-            # Fallback to FlareSolverr
-            payload = {
-                "cmd": "request.get",
-                "url": url,
-                "maxTimeout": 30000,
-                "headers": HEADERS
-            }
-            fs = requests.post(FLARESOLVERR_URL, json=payload, timeout=60)
-            if fs.status_code == 200:
-                return fs.json().get("solution", {}).get("response")
     except Exception as e:
         print(f"Error fetching {url}: {e}", file=sys.stderr)
     return None
@@ -217,7 +263,9 @@ end = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemap_locs)
 sitemap_locs = sitemap_locs[SITEMAP_OFFSET:end]
 
 print(f"Total sitemaps to analyze: {len(sitemap_locs)}")
-print(f"Chunk generator workers: {CHUNK_GEN_WORKERS}")
+print(f"Chunk generator workers (configured): {CHUNK_GEN_WORKERS}")
+print(f"Chunk generator workers (effective): {EFFECTIVE_CHUNK_GEN_WORKERS}")
+print(f"FlareSolverr endpoints: {', '.join(FLARESOLVERR_URLS) if FLARESOLVERR_URLS else 'none'}")
 
 # ---------- 2. For each sitemap, count product URLs ----------
 sitemap_stats = []
@@ -232,7 +280,7 @@ def process_sitemap(sm_url):
         return {"url": sm_url, "total_urls": 0}
     urls = []
     for loc in root_sm.findall(".//ns:loc", ns) or root_sm.findall(".//loc"):
-        if loc.text and ".html" in loc.text and not any(
+        if loc.text and ".htm" in loc.text and not any(
             ext in loc.text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
         ):
             urls.append(loc.text.strip())
@@ -241,12 +289,11 @@ def process_sitemap(sm_url):
         total = MAX_URLS_PER_SITEMAP
     return {"url": sm_url, "total_urls": total}
 
-worker_count = max(1, min(CHUNK_GEN_WORKERS, len(sitemap_locs)))
+worker_count = max(1, min(EFFECTIVE_CHUNK_GEN_WORKERS, len(sitemap_locs)))
 with ThreadPoolExecutor(max_workers=worker_count) as executor:
     futures = [executor.submit(process_sitemap, url) for url in sitemap_locs]
     for future in as_completed(futures):
         sitemap_stats.append(future.result())
-        time.sleep(0.2)  # be polite
 
 # ---------- 3. Generate chunks (one matrix entry per chunk) ----------
 chunks = []
