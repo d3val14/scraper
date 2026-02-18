@@ -160,25 +160,25 @@ def start_new_driver(search_url):
 def download_csv_from_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, remote_filename, local_filename):
     """Download CSV file from FTP"""
     try:
-        print(f"Downloading {remote_filename} from FTP...")
+        # print(f"Downloading {remote_filename} from FTP...")
         
-        ftp = ftplib.FTP()
-        ftp.connect(ftp_host, int(os.getenv("FTP_PORT", 21)))
-        ftp.login(ftp_user, ftp_pass)
-        ftp.set_pasv(True)
+        # ftp = ftplib.FTP()
+        # ftp.connect(ftp_host, int(os.getenv("FTP_PORT", 21)))
+        # ftp.login(ftp_user, ftp_pass)
+        # ftp.set_pasv(True)
         
-        if ftp_path and ftp_path != '/':
-            try:
-                ftp.cwd(ftp_path)
-            except:
-                print(f"Error: Could not change to directory {ftp_path}")
-                return None
+        # if ftp_path and ftp_path != '/':
+        #     try:
+        #         ftp.cwd(ftp_path)
+        #     except:
+        #         print(f"Error: Could not change to directory {ftp_path}")
+        #         return None
         
-        with open(local_filename, 'wb') as f:
-            ftp.retrbinary(f'RETR {remote_filename}', f.write)
+        # with open(local_filename, 'wb') as f:
+        #     ftp.retrbinary(f'RETR {remote_filename}', f.write)
         
-        ftp.quit()
-        print(f"✓ Downloaded {remote_filename} to {local_filename}")
+        # ftp.quit()
+        # print(f"✓ Downloaded {remote_filename} to {local_filename}")
         return local_filename
         
     except Exception as e:
@@ -448,7 +448,46 @@ def scrape_product(driver, product_id, keyword, url):
             except:
                 result['last_response'] = "Could not click product element"
         
-        result['product_url'] = driver.current_url
+        # Prefer the stable Google "Share link" URL from the right panel.
+        share_url = ""
+        try:
+            share_button = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    "//div[contains(@class,'RSNrZe') and @role='button' and @aria-label='Share']"
+                ))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", share_button)
+            share_button.click()
+
+            share_dialog = WebDriverWait(driver, 8).until(
+                EC.visibility_of_element_located((By.XPATH, "//div[@role='dialog' and @aria-label='Share']"))
+            )
+
+            try:
+                share_input = share_dialog.find_element(By.CSS_SELECTOR, "input[aria-label='Share link'][type='url']")
+                share_url = (share_input.get_attribute("value") or "").strip()
+            except:
+                share_url = ""
+
+            if not share_url:
+                try:
+                    share_url = share_dialog.find_element(By.CSS_SELECTOR, "div[jsname='tQ9n1c']").text.strip()
+                except:
+                    share_url = ""
+
+            # Close share dialog so it doesn't block following actions.
+            try:
+                close_button = share_dialog.find_element(By.CSS_SELECTOR, "[jsname='tqp7ud']")
+                close_button.click()
+            except:
+                try:
+                    ActionChains(driver).send_keys(u'\ue00c').perform()  # ESC
+                except:
+                    pass
+        except:
+            share_url = ""
+        result['product_url'] = share_url or driver.current_url
         
         # Try to get more stores
         i = 0
