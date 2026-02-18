@@ -18,6 +18,9 @@ import pandas as pd
 import argparse
 import re
 from urllib.parse import urlparse, unquote
+import os
+import sys
+
 # Import the existing captcha solving functions
 try:
     from solvecaptcha import solve_recaptcha_audio
@@ -39,9 +42,19 @@ except ImportError:
             print("Captcha solving module not available. Please install solvecaptcha.")
             return "failed"
 
+if os.getenv('GITHUB_ACTIONS'):
+    os.environ['PULSE_SERVER'] = 'unix:/run/user/$(id -u)/pulse/native'
+    # Disable audio playback (we only need to capture)
+    os.environ['DISABLE_AUDIO_PLAYBACK'] = '1'
+
+
 def setup_driver():
     time.sleep(2)
     options = uc.ChromeOptions()
+
+    # Use a persistent profile
+    profile_path = os.path.join(os.getcwd(), "chrome_profile")
+    options.add_argument(f"--user-data-dir={profile_path}")
     
     # Comment out for local testing to see browser
     # options.add_argument("--headless=new")
@@ -100,36 +113,18 @@ def detects_recaptcha(driver):
 # In your main gscrapperci.py, update the handle_captcha function:
 
 def handle_captcha(driver, url):
-    """Handle captcha if detected with retry logic"""
-    max_retries = 1
-
+    max_retries = 2
     for attempt in range(max_retries):
-        recaptcha = detects_recaptcha(driver)
-        if recaptcha:
-            print(f"Attempt {attempt + 1}/{max_retries} to solve captcha...")
+        if detects_recaptcha(driver):
             result = solve_recaptcha_audio(driver)
-            
             if result == "solved":
-                print("Captcha solved successfully!")
-                driver.switch_to.default_content()
                 return "solved"
             else:
-                print(f"Captcha solving attempt {attempt + 1} failed")
-                
-                # if attempt < max_retries - 1:
-                #     # Try refreshing the page
-                #     print("Refreshing page and retrying...")
-                #     driver.refresh()
-                #     time.sleep(5)
-                # else:
-                #     print("All captcha solving attempts failed")
-                #     return "failed"
-                print("All captcha solving attempts failed")
-                return "failed"
+                wait_time = (2 ** attempt) + random.uniform(1, 3)
+                time.sleep(wait_time)
+                driver.refresh()
         else:
-            print("No reCAPTCHA found.")
             return "no_captcha"
-    
     return "failed"
 
 def start_new_driver(search_url):
