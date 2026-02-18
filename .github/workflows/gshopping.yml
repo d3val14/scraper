@@ -279,48 +279,31 @@ jobs:
           python merge_results.py
 
       - name: Upload merged files to FTP
-        if: success()  # Only upload if merge was successful
+        if: success()
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
           FTP_PATH: ${{ secrets.FTP_PATH }}
         run: |
-          # Create FTP upload script
-          cat > ftp_upload.sh <<'EOF'
-          #!/bin/bash
-          HOST="$1"
-          USER="$2"
-          PASS="$3"
-          PATH="$4"
-          FILE="$5"
-
-          ftp -n $HOST <<END_SCRIPT
-          quote USER $USER
-          quote PASS $PASS
-          binary
-          cd $PATH
-          put $FILE
-          quit
-          END_SCRIPT
-          EOF
-
-          chmod +x ftp_upload.sh
-
-          # Upload each merged file
+          # Upload each merged file using curl
           for file in merged_products_*.csv merged_sellers_*.csv; do
             if [ -f "$file" ]; then
-              echo "Uploading $file..."
-              ./ftp_upload.sh "$FTP_HOST" "$FTP_USER" "$FTP_PASS" "$FTP_PATH" "$file"
+              echo "Uploading $file to ftp://$FTP_HOST$FTP_PATH/"
+              
+              # Using curl for FTP upload
+              curl -T "$file" \
+                --user "$FTP_USER:$FTP_PASS" \
+                "ftp://$FTP_HOST$FTP_PATH/$file"
               
               if [ $? -eq 0 ]; then
                 echo "✓ Uploaded $file"
               else
                 echo "✗ Failed to upload $file"
+                exit 1
               fi
             fi
           done
-
       - name: Upload merged artifacts
         uses: actions/upload-artifact@v4
         with:
