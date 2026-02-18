@@ -159,6 +159,7 @@ jobs:
 
             product_files = []
             seller_files = []
+            remaining_files = []
 
             for root, _, files in os.walk("chunks"):
                 for f in files:
@@ -167,6 +168,8 @@ jobs:
                         product_files.append(path)
                     elif f.endswith(".csv") and "seller" in f:
                         seller_files.append(path)
+                    elif f.endswith(".csv") and "gshopping_remaining" in f:
+                        remaining_files.append(path)
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -179,6 +182,12 @@ jobs:
                 df = pd.concat((pd.read_csv(f) for f in seller_files), ignore_index=True)
                 df.sort_values(["product_id", "seller"], inplace=True)
                 df.to_csv(f"merged_sellers_{ts}.csv", index=False)
+
+            if remaining_files:
+                df = pd.concat((pd.read_csv(f) for f in remaining_files), ignore_index=True)
+                if "product_id" in df.columns:
+                    df.sort_values("product_id", inplace=True)
+                df.to_csv("gshopping_remaining.csv", index=False)
             EOF
 
                 python merge_results.py
@@ -216,6 +225,7 @@ jobs:
 
                     for f in merged_products_*.csv; do upload "$f"; done
                     for f in merged_sellers_*.csv; do upload "$f"; done
+                    for f in gshopping_remaining.csv; do upload "$f"; done
 
       - name: Upload merged artifacts
         uses: actions/upload-artifact@v4
@@ -224,6 +234,7 @@ jobs:
           path: |
             merged_products_*.csv
             merged_sellers_*.csv
+            gshopping_remaining.csv
           retention-days: 7
 
   notify:

@@ -595,6 +595,7 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
         # Initialize results
         product_results = []
         seller_results = []
+        remaining_results = []
         
         # Setup driver
         driver = setup_driver()
@@ -619,6 +620,14 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
             # Add to results
             product_results.append(scraped_data)
             seller_results.extend(scraped_data['competitors'])
+
+            # Keep original input-row shaped data for reprocessing when not completed
+            if scraped_data.get('status') != 'completed':
+                remaining_row = {
+                    col: ('' if pd.isna(row[col]) else row[col])
+                    for col in df.columns
+                }
+                remaining_results.append(remaining_row)
             
             # Sleep between products
             if index < len(df) - 1:
@@ -671,9 +680,11 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
         
         csv1_filename = f"product_info_chunk{chunk_id}_{timestamp}.csv"
         csv2_filename = f"seller_info_chunk{chunk_id}_{timestamp}.csv"
+        csv3_filename = f"gshopping_remaining_chunk{chunk_id}_{timestamp}.csv"
         
         csv1_path = os.path.join(output_dir, csv1_filename)
         csv2_path = os.path.join(output_dir, csv2_filename)
+        csv3_path = os.path.join(output_dir, csv3_filename)
         
         if csv1_data:
             pd.DataFrame(csv1_data).to_csv(csv1_path, index=False)
@@ -682,6 +693,10 @@ def process_chunk(chunk_file, chunk_id, total_chunks):
         if csv2_data:
             pd.DataFrame(csv2_data).to_csv(csv2_path, index=False)
             print(f"✓ Saved seller info: {csv2_filename}")
+
+        if remaining_results:
+            pd.DataFrame(remaining_results).to_csv(csv3_path, index=False)
+            print(f"✓ Saved remaining rows: {csv3_filename}")
         
         # Upload to FTP STOPPED TO AVOID UNNECESSARY FTP USAGE DURING TESTING
         # if csv1_data:
