@@ -606,7 +606,8 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
                 'seller_count': seller_count,
                 'osb_id': osb_id,
                 'status': 'completed',
-                'last_response': f'Completed - OSB Position: {osb_position}, Total Sellers: {seller_count}, OSB URL Match: {"Yes" if osb_url_match else "No"}'
+                'osb_url_match': f'{"Yes" if osb_url_match else "No"}',
+                'last_response': f'Completed - OSB Position: {osb_position}, Total Sellers: {seller_count}'
             })
             
         except Exception as e:
@@ -729,6 +730,10 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             # Add original fields back
             scraped_data['web_id'] = web_id
             scraped_data['osb_url'] = osb_url
+            scraped_data['name'] = row['Name']
+            scraped_data['mpn_sku'] = row['MPN/SKU']
+            scraped_data['gtin'] = row['GTIN']
+            scraped_data['brand'] = row['Brand']
             
             # Add to results
             product_results.append(scraped_data)
@@ -759,10 +764,15 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             csv1_row = {
                 'product_id': result.get('product_id', ''),
                 'web_id': result.get('web_id', ''),
+                'name' : result.get('name',''),
+                'mpn_sku' : result.get('mpn_sku',''),
+                'gtin' : result.get('gtin',''),
+                'brand' : result.get('brand',''),
                 'keyword': result.get('keyword', ''),
                 'url': result.get('url', ''),
                 'osb_url': result.get('osb_url', ''),
                 'last_response': result.get('last_response', ''),
+                'osb_url_match' : result.get('osb_url_match', ''),
                 'product_url': result.get('product_url', ''),
                 'seller': result.get('seller', ''),
                 'product_name': result.get('product_name', ''),
@@ -1013,7 +1023,7 @@ def main():
     print(f"Recursive mode: {'Yes' if args.recursive else 'No'}")
     print("=" * 60)
     
-    
+
     ftp_host = os.getenv('FTP_HOST')
     ftp_user = os.getenv('FTP_USER')
     ftp_pass = os.getenv('FTP_PASS')
