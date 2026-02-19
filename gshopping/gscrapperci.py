@@ -747,9 +747,15 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
         # Close driver
         driver.quit()
         
+        # Keep only non-remaining results in round outputs.
+        completed_product_results = [
+            r for r in product_results
+            if str(r.get('status', '')).strip().lower() != 'captcha_failed'
+        ]
+
         # Create CSV 1: Product Information
         csv1_data = []
-        for result in product_results:
+        for result in completed_product_results:
             csv1_row = {
                 'product_id': result.get('product_id', ''),
                 'web_id': result.get('web_id', ''),
@@ -773,7 +779,10 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
         
         # Create CSV 2: Seller Information
         csv2_data = []
+        completed_product_ids = {str(r.get('product_id', '')).strip() for r in completed_product_results}
         for seller in seller_results:
+            if str(seller.get('product_id', '')).strip() not in completed_product_ids:
+                continue
             csv2_row = {
                 'product_id': seller.get('product_id', ''),
                 'seller': seller.get('seller', ''),

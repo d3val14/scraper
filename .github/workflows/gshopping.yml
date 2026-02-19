@@ -145,6 +145,7 @@ jobs:
     outputs:
       has_remaining: ${{ steps.merge_results.outputs.has_remaining }}
       next_input_filename: ${{ steps.merge_results.outputs.next_input_filename }}
+      final_remaining_file: ${{ steps.merge_results.outputs.final_remaining_file }}
 
     steps:
       - uses: actions/checkout@v4
@@ -172,6 +173,7 @@ jobs:
           FTP_PASS: ${{ secrets.FTP_PASS }}
           FTP_PATH: ${{ secrets.FTP_PATH }}
           RUN_DEPTH: ${{ github.event.inputs.run_depth || '1' }}
+          MAX_DEPTH: ${{ github.event.inputs.max_depth || '10' }}
         run: |
           python - <<'PY'
           import os
@@ -184,6 +186,7 @@ jobs:
           ftp_port = int(os.environ.get("FTP_PORT", "21"))
           ftp_path = os.environ.get("FTP_PATH", "/scrap/")
           run_depth = int(os.environ.get("RUN_DEPTH", "1"))
+          max_depth = int(os.environ.get("MAX_DEPTH", "10"))
 
           product_files = []
           seller_files = []
@@ -209,18 +212,18 @@ jobs:
                   except Exception as e:
                       print(f"Warning reading {p}: {e}")
               if not frames:
-                  return None
+                  return None, None
               df = pd.concat(frames, ignore_index=True)
               if sort_cols:
                   cols = [c for c in sort_cols if c in df.columns]
                   if cols:
                       df = df.sort_values(cols)
               df.to_csv(out_name, index=False)
-              return out_name
+              return out_name, df
 
-          round_products = merge_files(product_files, "round_products.csv", ["product_id"])
-          round_sellers = merge_files(seller_files, "round_sellers.csv", ["product_id", "seller"])
-          round_remaining = merge_files(remaining_files, "gshopping_remaining.csv", ["product_id"])
+          round_products_file, round_products_df = merge_files(product_files, "round_products.csv", ["product_id"])
+          round_sellers_file, round_sellers_df = merge_files(seller_files, "round_sellers.csv", ["product_id", "seller"])
+          round_remaining_file, round_remaining_df = merge_files(remaining_files, "gshopping_remaining.csv", ["product_id"])
 
           if not all([ftp_host, ftp_user, ftp_pass]):
               raise RuntimeError("FTP credentials are missing")
@@ -256,62 +259,105 @@ jobs:
                   ftp.storbinary(f"STOR {remote_name}", f)
               print(f"Uploaded {remote_name}")
 
-          def update_cumulative(round_file, cumulative_remote, out_local, sort_cols):
-              if not round_file or not os.path.exists(round_file):
-                  return None
-              base_exists = ftp_download_if_exists(cumulative_remote, "_prev.csv")
-              frames = []
-              if base_exists:
-                  try:
-                      prev = pd.read_csv("_prev.csv")
-                      if not prev.empty:
-                          frames.append(prev)
-                  except Exception as e:
-                      print(f"Warning reading previous {cumulative_remote}: {e}")
-              cur = pd.read_csv(round_file)
-              if not cur.empty:
-                  frames.append(cur)
-              if not frames:
-                  return None
-              merged = pd.concat(frames, ignore_index=True)
-              cols = [c for c in sort_cols if c in merged.columns]
-              if cols:
-                  merged = merged.sort_values(cols)
-              merged.to_csv(out_local, index=False)
-              ftp_upload(out_local, cumulative_remote)
-              return out_local
+          def ftp_delete_if_exists(remote_name):
+              try:
+                  ftp.delete(remote_name)
+                  print(f"Deleted {remote_name}")
+              except Exception:
+                  pass
 
-          final_products_local = update_cumulative(
-              round_products,
-              "gshopping_products_final.csv",
-              "gshopping_products_final.csv",
-              ["product_id"],
-          )
-          final_sellers_local = update_cumulative(
-              round_sellers,
-              "gshopping_sellers_final.csv",
-              "gshopping_sellers_final.csv",
-              ["product_id", "seller"],
-          )
+          unresolved_ids = set()
+          if round_remaining_df is not None and "product_id" in round_remaining_df.columns:
+              unresolved_ids = set(round_remaining_df["product_id"].astype(str).str.strip().tolist())
+
+          if round_products_df is not None:
+              if "status" in round_products_df.columns:
+                  round_products_df = round_products_df[
+                      round_products_df["status"].astype(str).str.strip().str.lower() != "captcha_failed"
+                  ]
+              if unresolved_ids and "product_id" in round_products_df.columns:
+                  round_products_df = round_products_df[
+                      ~round_products_df["product_id"].astype(str).str.strip().isin(unresolved_ids)
+                  ]
+
+          if round_sellers_df is not None and unresolved_ids and "product_id" in round_sellers_df.columns:
+              round_sellers_df = round_sellers_df[
+                  ~round_sellers_df["product_id"].astype(str).str.strip().isin(unresolved_ids)
+              ]
+
+          def load_prev_csv(remote_name):
+              if not ftp_download_if_exists(remote_name, "_prev.csv"):
+                  return None
+              try:
+                  return pd.read_csv("_prev.csv")
+              except Exception:
+                  return None
+
+          prev_products_df = load_prev_csv("gshopping_products_final.csv")
+          prev_sellers_df = load_prev_csv("gshopping_sellers_final.csv")
+
+          if prev_products_df is not None and unresolved_ids and "product_id" in prev_products_df.columns:
+              prev_products_df = prev_products_df[
+                  ~prev_products_df["product_id"].astype(str).str.strip().isin(unresolved_ids)
+              ]
+          if prev_sellers_df is not None and unresolved_ids and "product_id" in prev_sellers_df.columns:
+              prev_sellers_df = prev_sellers_df[
+                  ~prev_sellers_df["product_id"].astype(str).str.strip().isin(unresolved_ids)
+              ]
+
+          product_frames = [df for df in [prev_products_df, round_products_df] if df is not None and not df.empty]
+          seller_frames = [df for df in [prev_sellers_df, round_sellers_df] if df is not None and not df.empty]
+
+          if product_frames:
+              final_products_df = pd.concat(product_frames, ignore_index=True)
+              if "product_id" in final_products_df.columns:
+                  final_products_df["__pid"] = final_products_df["product_id"].astype(str).str.strip()
+                  final_products_df = final_products_df.drop_duplicates(subset=["__pid"], keep="last").drop(columns=["__pid"])
+                  final_products_df = final_products_df.sort_values(["product_id"])
+              final_products_df.to_csv("gshopping_products_final.csv", index=False)
+              ftp_upload("gshopping_products_final.csv", "gshopping_products_final.csv")
+
+          if seller_frames:
+              final_sellers_df = pd.concat(seller_frames, ignore_index=True)
+              dedupe_cols = [c for c in ["product_id", "seller", "seller_product_name", "seller_url", "seller_price"] if c in final_sellers_df.columns]
+              if dedupe_cols:
+                  final_sellers_df = final_sellers_df.drop_duplicates(subset=dedupe_cols, keep="last")
+              sort_cols = [c for c in ["product_id", "seller"] if c in final_sellers_df.columns]
+              if sort_cols:
+                  final_sellers_df = final_sellers_df.sort_values(sort_cols)
+              final_sellers_df.to_csv("gshopping_sellers_final.csv", index=False)
+              ftp_upload("gshopping_sellers_final.csv", "gshopping_sellers_final.csv")
 
           has_remaining = "false"
           next_input_filename = ""
+          final_remaining_file = ""
 
-          if round_remaining and os.path.exists(round_remaining):
-              rem_df = pd.read_csv(round_remaining)
+          if round_remaining_file and os.path.exists(round_remaining_file):
+              rem_df = pd.read_csv(round_remaining_file)
               if not rem_df.empty:
                   has_remaining = "true"
                   next_input_filename = f"gshopping_remaining_depth_{run_depth}.csv"
-                  ftp_upload(round_remaining, next_input_filename)
+                  ftp_upload(round_remaining_file, next_input_filename)
+
+                  # Keep a stable remaining filename only when recursion stops at max depth.
+                  if run_depth >= max_depth:
+                      ftp_upload(round_remaining_file, "gshopping_remaining.csv")
+                      final_remaining_file = "gshopping_remaining.csv"
+              else:
+                  ftp_delete_if_exists("gshopping_remaining.csv")
+          else:
+              ftp_delete_if_exists("gshopping_remaining.csv")
 
           ftp.quit()
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"has_remaining={has_remaining}\n")
               f.write(f"next_input_filename={next_input_filename}\n")
+              f.write(f"final_remaining_file={final_remaining_file}\n")
 
           print(f"has_remaining={has_remaining}")
           print(f"next_input_filename={next_input_filename}")
+          print(f"final_remaining_file={final_remaining_file}")
           PY
 
       - name: Upload merged artifacts
@@ -359,8 +405,67 @@ jobs:
 
             core.info(`Triggered next round depth=${nextDepth} with input=${nextInput}`);
 
-  notify:
+  cleanup_depth_files:
     needs: [merge, dispatch_next_round]
+    if: ${{ always() && needs.dispatch_next_round.result == 'skipped' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cleanup depth files on FTP
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_PATH: ${{ secrets.FTP_PATH }}
+        run: |
+          python - <<'PY'
+          import os
+          import ftplib
+
+          ftp_host = os.environ.get("FTP_HOST")
+          ftp_user = os.environ.get("FTP_USER")
+          ftp_pass = os.environ.get("FTP_PASS")
+          ftp_port = int(os.environ.get("FTP_PORT", "21"))
+          ftp_path = os.environ.get("FTP_PATH", "/scrap/")
+
+          if not all([ftp_host, ftp_user, ftp_pass]):
+              raise RuntimeError("FTP credentials are missing")
+
+          ftp = ftplib.FTP()
+          ftp.connect(ftp_host, ftp_port)
+          ftp.login(ftp_user, ftp_pass)
+          ftp.set_pasv(True)
+
+          if ftp_path and ftp_path != '/':
+              parts = [p for p in ftp_path.strip('/').split('/') if p]
+              cur = ''
+              for d in parts:
+                  cur += '/' + d
+                  try:
+                      ftp.cwd(cur)
+                  except Exception:
+                      ftp.mkd(cur)
+                      ftp.cwd(cur)
+
+          try:
+              names = ftp.nlst()
+          except Exception:
+              names = []
+
+          for name in names:
+              if name.startswith("gshopping_remaining_depth_") and name.endswith(".csv"):
+                  try:
+                      ftp.delete(name)
+                      print(f"Deleted {name}")
+                  except Exception as e:
+                      print(f"Could not delete {name}: {e}")
+
+          ftp.quit()
+          PY
+
+  notify:
+    needs: [merge, dispatch_next_round, cleanup_depth_files]
     if: always()
     runs-on: ubuntu-latest
 
