@@ -19,6 +19,31 @@ import argparse
 import re
 import shutil
 from urllib.parse import urlparse, unquote
+
+PRODUCT_FINAL_COLUMNS = [
+    "product_id",
+    "web_id",
+    "name",
+    "mpn_sku",
+    "gtin",
+    "brand",
+    "category",
+    "keyword",
+    "url",
+    "osb_url",
+    "last_response",
+    "osb_url_match",
+    "product_url",
+    "seller",
+    "product_name",
+    "cid",
+    "pid",
+    "last_fetched_date",
+    "osb_position",
+    "osb_id",
+    "seller_count",
+    "status",
+]
 # Import the existing captcha solving functions
 try:
     from solvecaptcha import solve_recaptcha_audio
@@ -383,7 +408,7 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
                 'competitors': []  # Already present
             }
         
-        time.sleep(random.uniform(5, 10))
+        time.sleep(random.uniform(4, 8))
         
         # Initialize result structure
         result = {
@@ -606,7 +631,8 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
                 'seller_count': seller_count,
                 'osb_id': osb_id,
                 'status': 'completed',
-                'last_response': f'Completed - OSB Position: {osb_position}, Total Sellers: {seller_count}, OSB URL Match: {"Yes" if osb_url_match else "No"}'
+                'osb_url_match': f'{"Yes" if osb_url_match else "No"}',
+                'last_response': f'Completed - OSB Position: {osb_position}, Total Sellers: {seller_count}'
             })
             
         except Exception as e:
@@ -628,7 +654,7 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
             'competitors': []
         }
 
-def merge_csv_files(file_paths, output_path, sort_columns=None):
+def merge_csv_files(file_paths, output_path, sort_columns=None, expected_columns=None):
     """Merge CSV files into one output CSV."""
     valid_files = [p for p in file_paths if p and os.path.exists(p) and os.path.getsize(p) > 0]
     if not valid_files:
@@ -647,6 +673,11 @@ def merge_csv_files(file_paths, output_path, sort_columns=None):
         return None, 0
 
     merged_df = pd.concat(frames, ignore_index=True)
+    if expected_columns:
+        for col in expected_columns:
+            if col not in merged_df.columns:
+                merged_df[col] = ""
+        merged_df = merged_df.loc[:, expected_columns]
     if sort_columns:
         available_cols = [c for c in sort_columns if c in merged_df.columns]
         if available_cols:
@@ -720,6 +751,11 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             keyword = row['keyword']
             url = row['url']
             osb_url = row['osb_url']
+            name = row['name']
+            mpnsku = row['mpn_sku']
+            gtin = row['gtin']
+            brand = row['brand']
+            cat = row['category']
             
             print(f"\nProcessing {index+1}/{len(df)}: Product ID {product_id}")
             
@@ -728,7 +764,13 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             
             # Add original fields back
             scraped_data['web_id'] = web_id
+            scraped_data['keyword'] = keyword
             scraped_data['osb_url'] = osb_url
+            scraped_data['name'] = name
+            scraped_data['mpn_sku'] = mpnsku
+            scraped_data['gtin'] = gtin
+            scraped_data['brand'] = brand
+            scraped_data['category'] = cat
             
             # Add to results
             product_results.append(scraped_data)
@@ -742,7 +784,7 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             
             # Sleep between products
             if index < len(df) - 1:
-                time.sleep(random.uniform(3, 6))
+                time.sleep(random.uniform(1,3))
         
         # Close driver
         driver.quit()
@@ -759,10 +801,16 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
             csv1_row = {
                 'product_id': result.get('product_id', ''),
                 'web_id': result.get('web_id', ''),
+                'name' : result.get('name',''),
+                'mpn_sku' : result.get('mpn_sku',''),
+                'gtin' : result.get('gtin',''),
+                'brand' : result.get('brand',''),
+                'category': result.get('category', ''),
                 'keyword': result.get('keyword', ''),
                 'url': result.get('url', ''),
                 'osb_url': result.get('osb_url', ''),
                 'last_response': result.get('last_response', ''),
+                'osb_url_match' : result.get('osb_url_match', ''),
                 'product_url': result.get('product_url', ''),
                 'seller': result.get('seller', ''),
                 'product_name': result.get('product_name', ''),
@@ -806,7 +854,7 @@ def process_chunk(chunk_file, chunk_id, total_chunks, round_id=1, output_dir='ou
         csv3_path = os.path.join(output_dir, csv3_filename)
         
         if csv1_data:
-            pd.DataFrame(csv1_data).to_csv(csv1_path, index=False)
+            pd.DataFrame(csv1_data, columns=PRODUCT_FINAL_COLUMNS).to_csv(csv1_path, index=False)
             print(f"✓ Saved product info: {csv1_filename}")
         
         if csv2_data:
@@ -923,6 +971,7 @@ def run_recursive_pipeline(input_csv, total_chunks, ftp_host, ftp_user, ftp_pass
             round_product_files,
             os.path.join(round_dir, f"merged_products_round{round_id}.csv"),
             sort_columns=["product_id"],
+            expected_columns=PRODUCT_FINAL_COLUMNS,
         )
         round_seller_merged, round_seller_rows = merge_csv_files(
             round_seller_files,
@@ -971,6 +1020,7 @@ def run_recursive_pipeline(input_csv, total_chunks, ftp_host, ftp_user, ftp_pass
         all_product_files,
         os.path.join(run_root, f"merged_products_final_{run_ts}.csv"),
         sort_columns=["product_id"],
+        expected_columns=PRODUCT_FINAL_COLUMNS,
     )
     final_sellers_file, final_seller_rows = merge_csv_files(
         all_seller_files,
@@ -1013,7 +1063,7 @@ def main():
     print(f"Recursive mode: {'Yes' if args.recursive else 'No'}")
     print("=" * 60)
     
-    
+
     ftp_host = os.getenv('FTP_HOST')
     ftp_user = os.getenv('FTP_USER')
     ftp_pass = os.getenv('FTP_PASS')
