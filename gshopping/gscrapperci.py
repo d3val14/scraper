@@ -982,6 +982,7 @@ def run_recursive_pipeline(input_csv, total_chunks, ftp_host, ftp_user, ftp_pass
             round_remaining_files,
             os.path.join(round_dir, f"gshopping_remaining_round{round_id}.csv"),
             sort_columns=["product_id"],
+            expected_columns=PRODUCT_FINAL_COLUMNS,
         )
 
         # Upload round-level merged files only after the full round has finished.
