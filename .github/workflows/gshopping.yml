@@ -179,6 +179,7 @@ jobs:
           import os
           import ftplib
           import pandas as pd
+          from datetime import datetime
 
           ftp_host = os.environ.get("FTP_HOST")
           ftp_user = os.environ.get("FTP_USER")
@@ -244,6 +245,8 @@ jobs:
                       ftp.mkd(cur)
                       ftp.cwd(cur)
 
+          base_cwd = ftp.pwd()
+
           def ftp_download_if_exists(remote_name, local_name):
               try:
                   with open(local_name, 'wb') as f:
@@ -254,10 +257,19 @@ jobs:
                       os.remove(local_name)
                   return False
 
-          def ftp_upload(local_name, remote_name):
+          def ftp_upload(local_name, remote_name, subdir=None):
+              ftp.cwd(base_cwd)
+              if subdir:
+                  for d in [p for p in subdir.strip("/").split("/") if p]:
+                      try:
+                          ftp.cwd(d)
+                      except Exception:
+                          ftp.mkd(d)
+                          ftp.cwd(d)
               with open(local_name, 'rb') as f:
                   ftp.storbinary(f"STOR {remote_name}", f)
-              print(f"Uploaded {remote_name}")
+              ftp.cwd(base_cwd)
+              print(f"Uploaded {remote_name}" + (f" to {subdir}" if subdir else ""))
 
           def ftp_delete_if_exists(remote_name):
               try:
@@ -307,6 +319,7 @@ jobs:
 
           product_frames = [df for df in [prev_products_df, round_products_df] if df is not None and not df.empty]
           seller_frames = [df for df in [prev_sellers_df, round_sellers_df] if df is not None and not df.empty]
+          final_subdir = f"gshoping/{datetime.utcnow().strftime('%Y-%m-%d')}"
 
           if product_frames:
               final_products_df = pd.concat(product_frames, ignore_index=True)
@@ -315,7 +328,7 @@ jobs:
                   final_products_df = final_products_df.drop_duplicates(subset=["__pid"], keep="last").drop(columns=["__pid"])
                   final_products_df = final_products_df.sort_values(["product_id"])
               final_products_df.to_csv("gshopping_products_final.csv", index=False)
-              ftp_upload("gshopping_products_final.csv", "gshopping_products_final.csv")
+              ftp_upload("gshopping_products_final.csv", "gshopping_products_final.csv", subdir=final_subdir)
 
           if seller_frames:
               final_sellers_df = pd.concat(seller_frames, ignore_index=True)
@@ -326,7 +339,7 @@ jobs:
               if sort_cols:
                   final_sellers_df = final_sellers_df.sort_values(sort_cols)
               final_sellers_df.to_csv("gshopping_sellers_final.csv", index=False)
-              ftp_upload("gshopping_sellers_final.csv", "gshopping_sellers_final.csv")
+              ftp_upload("gshopping_sellers_final.csv", "gshopping_sellers_final.csv", subdir=final_subdir)
 
           has_remaining = "false"
           next_input_filename = ""
