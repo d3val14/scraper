@@ -4,29 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       sites:
-        description: "Comma-separated sites/domains (example: www.cymax.com,www.example.com)"
+        description: "Site to Scrap (Comma-separated)"
         required: true
         default: "www.cymax.com"
       output_csv:
-        description: "Base output CSV filename (before timestamp)"
+        description: "filename(before timestamp)"
         required: true
-        default: "cymax_products_from_sitemaps.csv"
+        default: "cymax_url.csv"
       sitemap_offset:
         description: "Sitemap offset (start index)"
         required: true
-        default: "0"
+        default: "1"
       max_sitemaps:
         description: "How many sitemap files to process from the offset (0 = all)"
         required: true
-        default: "4"
+        default: "2"
       sitemaps_per_job:
         description: "How many sitemap files each matrix job should process"
         required: true
-        default: "2"
+        default: "1"
       max_urls_per_sitemap:
         description: "Max product URLs to read from each sitemap (0 = all)"
         required: true
-        default: "0"
+        default: "5"
 
 jobs:
   plan:

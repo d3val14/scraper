@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import html
 import re
 import sys
 from collections import deque
@@ -60,11 +61,33 @@ def fetch_with_flaresolverr(
 
 
 def extract_sitemaps_from_robots(robots_text: str) -> List[str]:
-    pattern = re.compile(r"^\s*Sitemap:\s*(\S+)\s*$", flags=re.IGNORECASE | re.MULTILINE)
-    return [match.group(1).strip() for match in pattern.finditer(robots_text)]
+    # Stop URL capture before any HTML tag fragments and normalize common wrappers.
+    pattern = re.compile(r"^\s*Sitemap:\s*([^\s<]+)", flags=re.IGNORECASE | re.MULTILINE)
+    urls: List[str] = []
+    for match in pattern.finditer(robots_text):
+        raw = html.unescape(match.group(1).strip())
+        clean = raw.split("<", 1)[0].strip().rstrip(".,;")
+        if clean:
+            urls.append(clean)
+    return urls
+
+
+def maybe_unwrap_html_wrapped_text(content: str) -> str:
+    text = content.strip().lstrip("\ufeff")
+    lower = text.lower()
+
+    if "<html" in lower and "<pre" in lower:
+        pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", text, flags=re.IGNORECASE | re.DOTALL)
+        if pre_match:
+            unwrapped = html.unescape(pre_match.group(1)).strip().lstrip("\ufeff")
+            if unwrapped:
+                return unwrapped
+
+    return text
 
 
 def parse_sitemap_xml(xml_text: str) -> Tuple[str, List[str]]:
+    xml_text = maybe_unwrap_html_wrapped_text(xml_text)
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
